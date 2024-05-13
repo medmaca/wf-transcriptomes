@@ -70,9 +70,6 @@
                     "help_text": "If selected and if the input is a multiplex directory the workflow will also process the unclassified directory."
                 }
             },
-            "allOf": [
-                []
-            ],
             "required": [
                 "fastq"
             ]
