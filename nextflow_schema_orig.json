@@ -14,7 +14,6 @@
             "type": "object",
             "fa_icon": "fas fa-terminal",
             "description": "Parameters for finding and handling input data for analysis.",
-            "default": "",
             "properties": {
                 "fastq": {
                     "type": "string",
@@ -59,23 +58,26 @@
                 },
                 "direct_rna": {
                     "type": "boolean",
+                    "default": false,
                     "title": "direct RNA",
                     "description": "Set to true for direct RNA sequencing.",
                     "help_text": " Omits the pychopper step."
                 },
                 "analyse_unclassified": {
                     "type": "boolean",
+                    "default": false,
                     "title": "Analyse unclassified",
                     "description": "Analyse unclassified reads from input directory. By default the workflow will not process reads in the unclassified directory.",
                     "help_text": "If selected and if the input is a multiplex directory the workflow will also process the unclassified directory."
                 }
             },
             "allOf": [
-                []
-            ],
-            "required": [
-                "fastq"
-            ]
+                {
+                    "required": [
+                        "fastq",
+                        "transcriptome_source"
+                    ]
+                }]
         },
         "output_options": {
             "title": "Output Options",
@@ -86,12 +88,10 @@
                 "out_dir": {
                     "type": "string",
                     "format": "directory-path",
+                    "default": "output",
                     "description": "Directory for output of all user-facing files."
                 }
-            },
-            "required": [
-                "out_dir"
-            ]
+            }
         },
         "sample_options": {
             "title": "Sample Options",
@@ -218,6 +218,7 @@
             "properties": {
                 "de_analysis": {
                     "type": "boolean",
+                    "default": false,
                     "title": "Differential expression analysis",
                     "description": "Run DE anaylsis",
                     "help_text": "Running this requires you to provide at least two replicates for a control and treated sample as well as a sample sheet param."
@@ -315,48 +316,21 @@
             "properties": {
                 "help": {
                     "type": "boolean",
+                    "default": false,
                     "description": "Display help text.",
                     "fa_icon": "fas fa-question-circle",
                     "hidden": true
                 },
                 "disable_ping": {
                     "type": "boolean",
+                    "default": false,
                     "description": "Enable to prevent sending a workflow ping."
                 },
                 "version": {
                     "type": "boolean",
+                    "default": false,
                     "description": "Display version and exit.",
                     "hidden": true
-                },
-                "aws_image_prefix": {
-                    "type": "string",
-                    "hidden": true
-                },
-                "aws_queue": {
-                    "type": "string",
-                    "hidden": true
-                },
-                "monochrome_logs": {
-                    "type": "boolean"
-                },
-                "validate_params": {
-                    "type": "boolean",
-                    "default": true
-                },
-                "show_hidden_params": {
-                    "type": "boolean"
-                },
-                "max_memory": {
-                    "type": "string",
-                    "default": "256.GB"
-                },
-                "max_cpus": {
-                    "type": "integer",
-                    "default": 32
-                },
-                "max_time": {
-                    "type": "string",
-                    "default": "48.h"
                 }
             }
         }
@@ -387,6 +361,26 @@
             "$ref": "#/definitions/miscellaneous_options"
         }
     ],
+    "properties": {
+        "aws_image_prefix": {
+            "type": "string",
+            "hidden": true
+        },
+        "aws_queue": {
+            "type": "string",
+            "hidden": true
+        },
+        "monochrome_logs": {
+            "type": "boolean"
+        },
+        "validate_params": {
+            "type": "boolean",
+            "default": true
+        },
+        "show_hidden_params": {
+            "type": "boolean"
+        }
+    },
     "resources": {
         "recommended": {
             "cpus": 16,
