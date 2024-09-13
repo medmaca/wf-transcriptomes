@@ -59,9 +59,9 @@
                 },
                 "direct_rna": {
                     "type": "boolean",
-                    "title": "direct RNA",
-                    "description": "Set to true for direct RNA sequencing.",
-                    "help_text": " Omits the pychopper step."
+                    "title": "Skip Pychopper step",
+                    "description": "Set to true to skip Pychopper step, i.e. if your reads have already been demultiplexed and barcode and adapter-trimmed.",
+                    "help_text": " Omit the Pychopper step."
                 },
                 "analyse_unclassified": {
                     "type": "boolean",
