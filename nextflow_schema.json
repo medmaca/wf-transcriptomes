@@ -57,7 +57,7 @@
                     "description": "A reference annotation in GFF2 or GFF3 format (extensions .gtf(.gz), .gff(.gz), .gff3(.gz)). Only annotation files from [Encode](https://www.encodeproject.org), [Ensembl](https://www.ensembl.org/index.html) and [NCBI](https://www.ncbi.nlm.nih.gov/) are supported.",
                     "help_text": "This will be used for guiding the transcriptome assembly and to label transcripts with their corresponding gene identifiers."
                 },
-                "direct_rna": {
+                "skip_pychopper": {
                     "type": "boolean",
                     "title": "Skip Pychopper step",
                     "description": "Set to true to skip Pychopper step, i.e. if your reads have already been demultiplexed and barcode and adapter-trimmed.",
