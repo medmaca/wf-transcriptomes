@@ -581,7 +581,7 @@ workflow pipeline {
         sample_ids = input_reads.flatMap({meta,samples -> meta.alias})
         per_read_stats = reads.map{ meta, samples, stats -> stats.resolve("per-read-stats.tsv.gz") }.toList()
 
-        if (!params.direct_rna){
+        if (!params.skip_pychopper){
             preprocess_reads(input_reads)
             full_len_reads = preprocess_reads.out.full_len_reads
             pychopper_report = preprocess_reads.out.report.collectFile(keepHeader: true)
