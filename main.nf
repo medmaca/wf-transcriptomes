@@ -234,6 +234,16 @@ workflow wf {
 
 WorkflowMain.initialise(workflow, params, log)
 workflow {
+    // Fork addition: upstream enforces these two rules in nextflow_schema.json
+    // (oneOf and dependencies), which were removed from the schema so that
+    // Seqera Platform accepts it. Check them here instead.
+    if (!params.fastq == !params.bam) {
+        error "Provide exactly one of --fastq or --bam."
+    }
+    if (params.de_analysis && !params.sample_sheet) {
+        error "--de_analysis requires --sample_sheet."
+    }
+
     Pinguscript.ping_start(nextflow, workflow, params)
 
 
