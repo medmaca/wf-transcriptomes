@@ -4,6 +4,166 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v2.0.3]
+This patch release of `wf-transcriptomes` removes a legacy configuration override that limited the memory allocation of the workflow when executed with the AWS Batch profile.
+This version will be deployed into EPI2ME Cloud to address issues with the alignment step. Local users do not need to adopt this release.
+
+### Fixed
+- "Container killed due to memory usage" when executing alignment in EPI2ME Cloud, by removing an errant configuration override that limited the memory allocated for cloud workflows.
+
+
+## [v2.0.2]
+
+This patch release of `wf-transcriptomes` fixes the `minimap2` invocation for cDNA read mapping, ensuring that both strands are searched for canonical splice sites.
+This release also distinguishes annotation seqnames with no transcript records after GFF-to-GTF conversion from seqnames that are absent from the annotation.
+Users analysing cDNA data should adopt this release.
+
+### Fixed
+- Incorrect strand assignment when mapping cDNA reads is fixed by using minimap2 `-ub` instead of `-uf`.
+- Dataframe merge error during PCA plotting caused by all numeric aliases in the sample sheet.
+
+### Added
+- Annotation preparation summary JSON and output report include a count of non-transcript records and associated seqnames that are pruned when converting a GFF to GTF. Seqnames that do not appear in the converted GTF but were present in the input GFF are now classified as "only in GFF" rather than "only in reference".
+
+### Changed
+- 2Ome* mod code labels are used in place of CHEBI numbers in output file names and reports for 2'-O-methylation modifications.
+- Removed mention of `analysis_group` and `type` sample sheet columns from `README.md` as they are not relevant for this workflow.
+
+
+## [v2.0.1]
+
+This patch release of `wf-transcriptomes` handles an additional quantification failure edge case that was not observed before release, fixes issues encountered by users during joint discovery when providing many samples, and makes some improvements to the volcano plot in the output report.
+Users of wf-transcriptomes v2.0.0 who have encountered issues during discovery and quantification should adopt this release.
+
+### Fixed
+- "Error in full_join" encountered during `runPerSampleBambuQuant` when all read classes have no compatible transcript assignment. An empty quant table is correctly emitted instead.
+- "unable to find an inherited method for function 'rowData'" encountered during `runJointBambuDiscover` when providing many samples. The workflow now correctly handles data spilled to disk by bambu discover.
+- Fatal memory error (exit 137) encountered during `collateBambuQuant` when providing many samples with a large reference. Collation now uses a two-pass approach to process the per-chunk RDS results to avoid exhausting memory limits.
+- Volcano plot class counts incorrect when `log2FoldChange` or `padj` columns contained NA values.
+- IGV track not correctly loading in EPI2ME Desktop when a sample consists of a single input BAM.
+
+### Added
+- Volcano plots now display the full y-axis range and include a slider to control the y-axis range maximum, which can be useful to exclude low p-value outliers.
+### Changed
+- Adjusted p-values below 0.001 in the volcano selection table were rounded to 0.000, these are now shown in scientific notation.
+
+
+## [v2.0.0]
+
+This release refreshes `wf-transcriptomes` around a new reference-guided transcriptomics workflow built on `bambu`, with `SQANTI3` transcript classification and QC, `DESeq2` for differential gene expression, `DEXSeq` for differential transcript usage, and per-sample modified base summarisation with `modkit` when modification tags are present in aligned BAMs.
+
+### Changed
+- Replaced the previous `StringTie/GffCompare/Salmon-based` transcript discovery and quantification workflow with a `bambu`-based workflow.
+- The main transcriptome result is now a shared cohort transcriptome built from all samples together.
+- Per-sample transcriptome FASTA outputs are now supplemented with per-sample GTF files, count tables, transcript metadata and QC summaries.
+- Differential gene expression now uses `DESeq2`.
+- Differential transcript usage continues to use `DEXSeq`, now driven from the shared bambu outputs.
+- Transcript classification and QC is now performed for both cohort and per-sample transcriptomes with `SQANTI3`.
+- Workflow prerequisites and experimental design inputs are validated earlier to catch common setup issues sooner.
+- Output structure has been reorganised around:
+  - `cohort/`
+  - `samples/<alias>/`
+  - `de_analysis/<contrast>/`
+- Differential analysis outputs are now grouped per contrast under `de_analysis/<contrast>/`.
+- The workflow now supports two bambu modes via `--transcriptome_mode`:
+  - `discover`
+  - `fixed_annotation`
+- Per-sample modified base summarisation from aligned BAMs containing `MM` and `ML` tags using modkit, including:
+  - `bedMethyl` pileup
+  - per-sample modification summary tables
+  - per-modification bigWig tracks
+- Reports have been refreshed with new components including:
+    - Sample-level hierarchical clustering, PCA and distance heatmap plots
+    - Contrast-level interactive volcano plots
+### Removed
+- Dependence on the older `StringTie/GffCompare/Salmon` transcriptomics pathway.
+- `--transcriptome_source` parameter; use `--transcriptome_mode` instead.
+- `--ref_transcriptome` parameter; use `--transcriptome_mode fixed_annotation` together with `--ref_genome` and `--ref_annotation`.
+- `--threads` parameter; advanced users may use Nextflow process selectors to override the preset per-process CPU and memory limits.
+
+## [v1.7.2]
+This patch release of wf-transcriptomes updates internal workflow naming, and does not affect any workflow outputs.
+### Changed
+- Removed workflow suffix from workflow title. This has no effect on the workflow.
+
+## [v1.7.1]
+### Changed
+- Updated to wf-template v5.6.2, changing:
+    - Reduce verbosity of debug logging from fastcat which can occasionally occlude errors found in FASTQ files during ingress.
+    - Log banner art to say "EPI2ME" instead of "EPI2ME Labs" to match current branding. This has no effect on the workflow outputs.
+    - pre-commit configuration to resolve an internal dependency problem with flake8. This has no effect on the workflow.
+- Stringtie updated to v2.2.3, which fixes stalling at transcriptome assembly step.
+- Gffcompare updated to v0.12.6, which fixes issue where ref_gene_id was assigned an nan value.
+### Fixed
+- Updated to wf-template v5.6.2, fixing:
+    - Sequence summary read length N50 incorrectly displayed minimum read length, it now correctly shows the N50.
+    - Sequence summary component alignment and coverage plots failed to plot under some conditions.
+- Error in `deAnalysis` process - `mode(counts) %in% "numeric" is not TRUE` - caused by hyphens in sample sheet aliases.
+- Error in `deAnalysis` process - `values in 'transcripts$tx_strand' must be "+" or "-"`.
+  - The workflow will now filter out any unstranded annotations from downstream analysis and log a warning.
+- Missing `results_dexseq.tsv` file when `--de_analysis` enabled.
+
+## [v1.7.0]
+### Changed
+- `split_bam` and `build_minimap_index_transcriptome` process memory allocation increased.
+- Updated recommended memory requirement.
+- Updated project description.
+- A common user issue is providing a ref_annotation and ref_genome parameter that have mismatched reference IDs, which causes the DE_analysis to fail. The workflow will now do an upfront check and give an error message if no overlap is found or a warning if some IDs are present in one file but not in the other.
+- Reconciled workflow with wf-template v5.5.0.
+- Sort the columns and rows of the gene and transcript count files.
+- DE_analysis alignment summary stats table no longer includes MAPQ or quality scores. MAPQ is not relevant for transcript alignment and quality scores are already available in the read summary section of the report. 
+### Fixed
+- `all_gene_counts.tsv` contained the DE counts results.
+- Reduced memory usage of the report workflow process.
+- Output BAM alignments in all cases unless the workflow is run with `transcriptome_source` set to `precomputed`.
+- Corrected the demo command in the `README.md`.
+- The merged transcriptome generated for differential expression analysis now only contains the exons and not the full genomic sequence.
+- Output the gene name annotated differential expression analysis count files only.
+- Only use full length reads in the differential expression analysis.
+
+## [v1.6.1]
+### Fixed
+- `merge_gff_compare` failing with empty GFF files.
+
+## [v1.6.0]
+### Fixed
+- v1.5.0 bug; access to undefined channel output bug when using precomputed transcriptome.
+- Bug where incorrect gene_id assigned in the DE tables.
+
+## [v1.5.0]
+### Fixed
+- Exons per isoforms histogram reporting incorrect numbers.
+- Output the `results_dexseq.tsv` file when `--de_analysis` enabled.
+### Removed
+- per-class gffcompare tracking files as there exists a combine tracking file. 
+
+## [v1.4.0]
+### Added
+- Added `--igv` parameter (default: false) for outputting IGV config allowing visualisation of read alignments in the EPI2ME App.
+- If required for IGV, reference indexes are output in to a `igv_reference` directory
+### Changed
+- BAMS are output in to a BAMS directory.
+- Reconcile with template 5.2.6.
+
+## [v1.3.0]
+### Removed
+- Fusion detection subworkflow, as the functionality is not robust enough for general use at this time.
+### Changed
+- Updated pychopper to 2.7.10
+### Added 
+- New `--cdna_kit` options: PCS114 and PCB111/114
+
+## [v1.2.1]
+### Changed
+- Increase some memory and CPU allocations.
+
+## [v1.2.0]
+### Added
+- Workflow now accepts BAM or FASTQ files as input (using the --bam or --fastq parameters, respectively).
+- Error message when running in `de_analysis` mode and `ref_annotation` input file contains unstranded annotations.
+### Changed
+- MA plot in the `results_dge.pdf` has been updated to match the MA plot in the report.
+
 ## [v1.1.1]
 ### Changed
 - Improved handling of different annotation file types (eg. `.gtf/.gff/.gff3`) in `de_analysis` mode.
@@ -19,6 +179,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   -  `de_analysis/all_counts_filtered.tsv` to `de_analysis/filtered_transcript_counts_with_genes.tsv`
   -  `de_analysis/de_tpm_transcript_counts.tsv` to `de_analysis/unfiltered_tpm_transcript_counts.tsv`
 - Minimum memory requirements to `32 GB`.
+- More memory assigned to the fusion detection process.
+- When no `--ref_annotation` is provided the workflow will still run but the output transcripts will not be annotated. However `--de_analysis` mode still requires a `--ref_annotation`.
 ### Added
 - Published isoforms table to output directory.
 - Output additional `de_analysis/cpm_gene_counts.tsv` with counts per million gene counts.
@@ -26,9 +188,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add gene name column to the de_analysis counts TSV files.
 ### Fixed
 - Mapping stage using a single thread only.
-### Changed
-- More memory assigned to the fusion detection process.
-- When no `--ref_annotation` is provided the workflow will still run but the output transcripts will not be annotated. However `--de_analysis` mode still requires a `--ref_annotation`.
 
 ## [v1.0.0]
 ### Added
@@ -197,4 +356,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - First release
 - Initial port of Snakemake WF from https://github.com/nanoporetech/pipeline-nanopore-ref-isoforms
-
