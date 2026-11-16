@@ -2,212 +2,299 @@
   "files": {
     "workflow-report": {
       "filepath": "wf-transcriptomes-report.html",
-      "title": "workflow report",
-      "description": "a HTML report document detailing the primary findings of the workflow",
+      "title": "Workflow report",
+      "description": "HTML report summarising transcript discovery, quantification, SQANTI3 classification, and optional differential analysis results.",
       "mime-type": "text/html",
       "optional": false,
       "type": "aggregated"
     },
-    "read-stats-per-file": {
-      "filepath": "fastq_ingress_results/reads/fastcat_stats/per-file-stats.tsv",
-      "title": "Per file read stats",
-      "description": "A TSV with per file read stats, including all samples.",
+    "sample-bam": {
+      "filepath": "samples/{{ alias }}/alignment/reads.bam",
+      "title": "Aligned BAM",
+      "description": "Genome-aligned BAM used for bambu, SQANTI3 QC, and IGV.",
+      "mime-type": "application/gzip",
+      "optional": false,
+      "type": "per-sample"
+    },
+    "sample-bai": {
+      "filepath": "samples/{{ alias }}/alignment/reads.bam.bai",
+      "title": "Aligned BAM index",
+      "description": "Index for the aligned BAM.",
+      "mime-type": "application/octet-stream",
+      "optional": false,
+      "type": "per-sample"
+    },
+    "sample-flagstat": {
+      "filepath": "samples/{{ alias }}/alignment/bamstats.flagstat.tsv",
+      "title": "Alignment summary",
+      "description": "bamstats flagstat summary for the aligned BAM.",
+      "mime-type": "text/tab-separated-values",
+      "optional": false,
+      "type": "per-sample"
+    },
+    "sample-bedmethyl": {
+      "filepath": "samples/{{ alias }}/mods/{{ alias }}.mods.bedmethyl.gz",
+      "title": "Modified base pileup",
+      "description": "Per-sample modkit bedMethyl pileup generated from the aligned BAM when MM and ML tags are present.",
+      "mime-type": "application/gzip",
+      "optional": true,
+      "type": "per-sample"
+    },
+    "sample-mod-summary": {
+      "filepath": "samples/{{ alias }}/mods/{{ alias }}.mods.summary.tsv",
+      "title": "Modified base summary",
+      "description": "Per-sample global modification-percent summary aggregated from the modkit bedMethyl pileup, with one row per modification code.",
+      "mime-type": "text/tab-separated-values",
+      "optional": true,
+      "type": "per-sample"
+    },
+    "sample-mod-bigwig": {
+      "filepath": "samples/{{ alias }}/mods/{{ alias }}.mods.*.bw",
+      "title": "Modified base bigWig",
+      "description": "Per-sample modkit bigWig tracks generated from the aligned BAM, with one file per requested or inferred modification code.",
+      "mime-type": "application/octet-stream",
+      "optional": true,
+      "type": "per-sample"
+    },
+    "annotation-reference-summary": {
+      "filepath": "cohort/reference/annotation_reference_summary.json",
+      "title": "Reference and annotation preparation summary",
+      "description": "Summary of reference and annotation preparation, including seqname overlap, build/provider hints, and excluded unstranded annotation counts.",
+      "mime-type": "application/json",
+      "optional": false,
+      "type": "aggregated"
+    },
+    "unstranded-annotation": {
+      "filepath": "cohort/reference/unstranded_annotation.gtf",
+      "title": "Excluded unstranded annotation records",
+      "description": "Full set of annotation records excluded because their strand was not '+' or '-'. Present only when unstranded records are found.",
+      "mime-type": "text/plain",
+      "optional": true,
+      "type": "aggregated"
+    },
+    "cohort-gtf": {
+      "filepath": "cohort/transcripts.gtf",
+      "title": "Cohort transcriptome GTF",
+      "description": "Joint bambu transcript model used as the primary cohort transcriptome.",
+      "mime-type": "text/plain",
+      "optional": false,
+      "type": "aggregated"
+    },
+    "cohort-fasta": {
+      "filepath": "cohort/cohort.transcriptome.fa",
+      "title": "Cohort transcriptome FASTA",
+      "description": "Transcript sequences derived from the joint cohort GTF.",
+      "mime-type": "text/plain",
+      "optional": false,
+      "type": "aggregated"
+    },
+    "cohort-transcript-counts": {
+      "filepath": "cohort/transcript_counts.tsv",
+      "title": "Cohort transcript counts",
+      "description": "Transcript-level count matrix produced by bambu.",
       "mime-type": "text/tab-separated-values",
       "optional": false,
       "type": "aggregated"
     },
-    "read-stats-per-read": {
-      "filepath": "fastq_ingress_results/reads/fastcat_stats/per-read-stats.tsv",
-      "title": "Read stats",
-      "description": "A TSV with per read stats, including all samples.",
+    "cohort-gene-counts": {
+      "filepath": "cohort/gene_counts.tsv",
+      "title": "Cohort gene counts",
+      "description": "Gene-level count matrix derived from bambu output.",
       "mime-type": "text/tab-separated-values",
       "optional": false,
       "type": "aggregated"
     },
-    "run-ids": {
-      "filepath": "fastq_ingress_results/reads/fastcat_stats/run_ids",
-      "title": "Run ID's",
-      "description": "List of run IDs present in reads.",
-      "mime-type": "text/txt",
+    "cohort-transcript-metadata": {
+      "filepath": "cohort/transcript_metadata.tsv",
+      "title": "Cohort transcript metadata",
+      "description": "Transcript annotations and bambu transcript classes for the cohort model.",
+      "mime-type": "text/tab-separated-values",
       "optional": false,
       "type": "aggregated"
     },
-    "metamap": {
-      "filepath": "fastq_ingress_results/reads/metamap.json",
-      "title": "Meta map json",
-      "description": "Metadata used in workflow presented in a JSON.",
-      "mime-type": "text/json",
-      "optional": false,
+    "cohort-sqanti-summary": {
+      "filepath": "cohort/sqanti/classification_summary.tsv",
+      "title": "Cohort SQANTI3 summary",
+      "description": "SQANTI3 classification summary for the cohort transcriptome.",
+      "mime-type": "text/tab-separated-values",
+      "optional": true,
       "type": "aggregated"
     },
-    "sample-data": {
-      "filepath": "fastq_ingress_results/reads/{{ alias }}.fastq.gz",
-      "title": "Concatenated sequence data",
-      "description": "Per sample reads concatenated in to one FASTQ file.",
-      "mime-type": "text/json",
+    "sample-gtf": {
+      "filepath": "samples/{{ alias }}/transcripts.gtf",
+      "title": "Per-sample transcriptome GTF",
+      "description": "Independent bambu transcript model for an individual sample.",
+      "mime-type": "text/plain",
       "optional": false,
       "type": "per-sample"
     },
-    "transcriptome": {
-      "filepath": "{{ alias }}_transcriptome.fas",
-      "title": "Assembled transcriptome",
-      "description": "Per sample assembled transcriptome.",
-      "mime-type": "text/x-fasta",
-      "optional": true,
-      "type": "per-sample"
-    },
-    "merged_transcriptome": {
-      "filepath": "{{ alias }}_merged_transcriptome.fas",
-      "title": "Annotated assembled transcriptome",
-      "description": "Per sample annotated assembled transcriptome.",
-      "mime-type": "text/x-fasta",
-      "optional": true,
-      "type": "per-sample"
-    },
-    "alignment-stats": {
-      "filepath": "{{ alias }}_read_aln_stats.tsv",
-      "title": "Alignment summary statistics",
-      "description": "Per sample alignment summary statistics.",
-      "mime-type": "text/tab-separated-valuesa",
+    "sample-fasta": {
+      "filepath": "samples/{{ alias }}/{{ alias }}.transcriptome.fa",
+      "title": "Per-sample transcriptome FASTA",
+      "description": "Transcript sequences derived from the per-sample GTF.",
+      "mime-type": "text/plain",
       "optional": false,
       "type": "per-sample"
     },
-    "gff_compare": {
-      "filepath": "{{ alias }}_gffcompare",
-      "title": "GFF compare results.",
-      "description": "All GFF compare output files.",
-      "mime-type": "text/directory",
+    "sample-transcript-counts": {
+      "filepath": "samples/{{ alias }}/transcript_counts.tsv",
+      "title": "Per-sample transcript counts",
+      "description": "Transcript-level abundance estimates for the per-sample bambu model.",
+      "mime-type": "text/tab-separated-values",
+      "optional": false,
+      "type": "per-sample"
+    },
+    "sample-gene-counts": {
+      "filepath": "samples/{{ alias }}/gene_counts.tsv",
+      "title": "Per-sample gene counts",
+      "description": "Gene-level abundance estimates for the per-sample bambu model.",
+      "mime-type": "text/tab-separated-values",
+      "optional": false,
+      "type": "per-sample"
+    },
+    "sample-transcript-metadata": {
+      "filepath": "samples/{{ alias }}/transcript_metadata.tsv",
+      "title": "Per-sample transcript metadata",
+      "description": "Transcript annotations and bambu transcript classes for the per-sample model.",
+      "mime-type": "text/tab-separated-values",
+      "optional": false,
+      "type": "per-sample"
+    },
+    "sample-sqanti-summary": {
+      "filepath": "samples/{{ alias }}/sqanti/classification_summary.tsv",
+      "title": "Per-sample SQANTI3 summary",
+      "description": "SQANTI3 classification summary for the per-sample transcriptome.",
+      "mime-type": "text/tab-separated-values",
       "optional": true,
       "type": "per-sample"
     },
-    "dge-results-tsv": {
-      "filepath": "de_analysis/results_dge.tsv",
+    "dge-results": {
+      "filepath": "de_analysis/{{ contrast }}/results_dge.tsv",
       "title": "Differential gene expression results",
-      "description": "This is a gene-level result file that describes genes and their probability of showing differential expression between experimental conditions.",
+      "description": "DESeq2 gene-level differential expression results for one contrast.",
       "mime-type": "text/tab-separated-values",
       "optional": true,
       "type": "aggregated"
     },
-    "dge-report-pdf": {
-      "filepath": "de_analysis/results_dge.pdf",
-      "title": "Differential gene expression report",
-      "description": "Summary report of differential gene expression analysis as a PDF.",
+    "dge-report": {
+      "filepath": "de_analysis/{{ contrast }}/results_dge.pdf",
+      "title": "Differential gene expression plots",
+      "description": "PDF plots generated during DESeq2 analysis for one contrast.",
       "mime-type": "application/pdf",
       "optional": true,
       "type": "aggregated"
     },
-    "dtu-gene-tsv": {
-      "filepath": "de_analysis/results_dtu_gene.tsv",
-      "title": "Differential transcript usage gene TSV",
-      "description": "This is a gene-level result file from DEXSeq that lists annotated genes and their probabilities of differential expression.",
+    "dtu-transcript-results": {
+      "filepath": "de_analysis/{{ contrast }}/results_dtu_transcript.tsv",
+      "title": "Differential transcript usage results",
+      "description": "Transcript-level DTU results for one contrast.",
       "mime-type": "text/tab-separated-values",
       "optional": true,
       "type": "aggregated"
     },
-    "dtu-report-pdf": {
-      "filepath": "de_analysis/results_dtu.pdf",
-      "title": "Differential transcript usage report",
-      "description": "Summary report of differential transcript usage results as a PDF.",
+    "dtu-gene-results": {
+      "filepath": "de_analysis/{{ contrast }}/results_dtu_gene.tsv",
+      "title": "Differential transcript usage gene summary",
+      "description": "Gene-level DTU summary for one contrast.",
+      "mime-type": "text/tab-separated-values",
+      "optional": true,
+      "type": "aggregated"
+    },
+    "dexseq-results": {
+      "filepath": "de_analysis/{{ contrast }}/results_dexseq.tsv",
+      "title": "DEXSeq results",
+      "description": "Full DEXSeq result table for one contrast.",
+      "mime-type": "text/tab-separated-values",
+      "optional": true,
+      "type": "aggregated"
+    },
+    "dtu-report": {
+      "filepath": "de_analysis/{{ contrast }}/results_dtu.pdf",
+      "title": "Differential transcript usage plots",
+      "description": "PDF plots generated during DEXSeq analysis for one contrast.",
       "mime-type": "application/pdf",
       "optional": true,
       "type": "aggregated"
     },
-    "dtu-transcript": {
-      "filepath": "de_analysis/results_dtu_transcript.tsv",
-      "title": "Differential transcript usage TSV",
-      "description": "This is a transcript-level result file from DEXSeq that lists annotated genes and their probabilities of differential expression.",
+    "de-qc-stats": {
+      "filepath": "de_analysis/de_qc_stats.json",
+      "title": "Differential analysis QC summary",
+      "description": "Structured DE/DTU QC summary. Use analysis_fallbacks for aggregate counts, and each contrast's deseq2_dispersion_fallback, dexseq_dispersion_method, and dexseq_covariates_dropped fields for interpretation.",
+      "mime-type": "application/json",
+      "optional": true,
+      "type": "aggregated"
+    },
+    "de-overall-summary": {
+      "filepath": "de_analysis/de_overall_summary.txt",
+      "title": "Differential analysis text summary",
+      "description": "Human-readable DE/DTU run summary across all contrasts.",
+      "mime-type": "text/plain",
+      "optional": true,
+      "type": "aggregated"
+    },
+    "de-contrast-qc-summary": {
+      "filepath": "de_analysis/{{ contrast }}/contrast_qc_summary.txt",
+      "title": "Per-contrast QC summary",
+      "description": "Human-readable per-contrast DE/DTU QC summary including sample counts and key significance totals.",
+      "mime-type": "text/plain",
+      "optional": true,
+      "type": "aggregated"
+    },
+    "deseq2-dispersion-fallback-diagnostic": {
+      "filepath": "de_analysis/DESeq2_dispersion_fallback_{{ contrast }}.txt",
+      "title": "DESeq2 fallback diagnostic",
+      "description": "Diagnostic details when DESeq2 falls back to gene-wise dispersion estimation.",
+      "mime-type": "text/plain",
+      "optional": true,
+      "type": "aggregated"
+    },
+    "dge-analysis-failed-diagnostic": {
+      "filepath": "de_analysis/{{ contrast }}/DGE_ANALYSIS_FAILED.txt",
+      "title": "DGE failure diagnostic",
+      "description": "Diagnostic details when DESeq2 fails for a contrast.",
+      "mime-type": "text/plain",
+      "optional": true,
+      "type": "aggregated"
+    },
+    "dtu-analysis-failed-diagnostic": {
+      "filepath": "de_analysis/{{ contrast }}/DTU_ANALYSIS_FAILED.txt",
+      "title": "DTU failure diagnostic",
+      "description": "Diagnostic details when DEXSeq fails for a contrast.",
+      "mime-type": "text/plain",
+      "optional": true,
+      "type": "aggregated"
+    },
+    "multiple-testing-warning": {
+      "filepath": "de_analysis/MULTIPLE_TESTING_WARNING.txt",
+      "title": "Multiple-testing warning",
+      "description": "Family-wise error-rate note generated when multiple contrasts are tested.",
+      "mime-type": "text/plain",
+      "optional": true,
+      "type": "aggregated"
+    },
+    "igv-config": {
+      "filepath": "igv.json",
+      "title": "IGV configuration",
+      "description": "JSON configuration for viewing the aligned BAMs in IGV.",
+      "mime-type": "application/json",
+      "optional": true,
+      "type": "aggregated"
+    },
+    "reference-index": {
+      "filepath": "reference/{{ ref_genome_file }}.fai",
+      "title": "Reference FASTA index",
+      "description": "FAI index for the reference genome published for IGV.",
       "mime-type": "text/tab-separated-values",
       "optional": true,
       "type": "aggregated"
     },
-    "dtu-stageR": {
-      "filepath": "de_analysis/results_dtu_stageR.tsv ",
-      "title": "Differential transcript usage stageR TSV",
-      "description": "This is the output from StageR and it shows both gene and transcript probabilities of differential expression",
-      "mime-type": "text/tab-separated-values",
+    "reference-gzi-index": {
+      "filepath": "reference/{{ ref_genome_file }}.gzi",
+      "title": "Reference GZI index",
+      "description": "GZI index for a compressed reference genome published for IGV.",
+      "mime-type": "application/octet-stream",
       "optional": true,
       "type": "aggregated"
-    },
-    "dexseq": {
-      "filepath": "de_analysis/results_dexseq.tsv",
-      "title": "Differential transcript usage DEXSeq TSV",
-      "description": "The complete output from the DEXSeq-analysis, shows both gene and transcript probabilities of differential expression.",
-      "mime-type": "text/tab-separated-values",
-      "optional": true,
-      "type": "aggregated"
-    },
-    "gene_counts": {
-      "filepath": "de_analysis/all_gene_counts.tsv",
-      "title": "Gene counts",
-      "description": "Raw gene counts created by the Salmon tool, before filtering.",
-      "mime-type": "text/tab-separated-values",
-      "optional": true,
-      "type": "aggregated"
-    },
-    "gene_counts_per_million": {
-      "filepath": "de_analysis/cpm_gene_counts.tsv",
-      "title": "Gene counts per million",
-      "description": "This file shows counts per million (CPM) of the raw gene counts to facilitate comparisons across samples.",
-      "mime-type": "text/tab-separated-values",
-      "optional": true,
-      "type": "aggregated"
-    },
-    "transcript_counts": {
-      "filepath": "de_analysis/unfiltered_transcript_counts_with_genes.tsv",
-      "title": "Transcript counts",
-      "description": "Raw transcript counts created by the Salmon tool, before filtering. Includes reference to the associated gene ID.",
-      "mime-type": "text/tab-separated-values",
-      "optional": true,
-      "type": "aggregated"
-    },
-    "tpm_transcript_counts": {
-      "filepath": "de_analysis/unfiltered_tpm_transcript_counts.tsv",
-      "title": "Transcript per million counts",
-      "description": "This file shows transcripts per million (TPM) of the raw counts to facilitate comparisons across samples.",
-      "mime-type": "text/tab-separated-values",
-      "optional": true,
-      "type": "aggregated"
-    },
-    "transcipt_counts_filtered": {
-      "filepath": "de_analysis/filtered_transcript_counts_with_genes.tsv",
-      "title": "Transcript counts filtered",
-      "description": "Filtered transcript counts, used for differential transcript usage analysis. Includes a reference to the associated gene ID.",
-      "mime-type": "text/tab-separated-values",
-      "optional": true,
-      "type": "aggregated"
-    },
-    "transcripts_table": {
-      "filepath": "{{ alias }}_transcripts_table.tsv",
-      "title": "Transcript info table",
-      "description": "This file details each isoform that was reconstructed from the input reads. It contains a subset of columns from the .tmap output from [gffcompare](https://ccb.jhu.edu/software/stringtie/gffcompare.shtml)",
-      "mime-type": "text/tab-separated-values",
-      "optional": true,
-      "type": "per-sample"
-    },
-    "final_non_redundant_transcriptome": {
-      "filepath": "de_analysis/final_non_redundant_transcriptome.fasta",
-      "title": "Final non redundant transcriptome",
-      "description": "Transcripts that were used for differential expression analysis including novel transcripts with the identifiers used for DE analysis.",
-      "mime-type": "text/x-fasta",
-      "optional": true,
-      "type": "aggregated"
-    },
-    "jaffa_fasta": {
-      "filepath": "jaffal_output_{{ alias }}/jaffa_results.fasta",
-      "title": "Fusion transcript sequences",
-      "description": "Fusion transcript sequences output by Jaffa.",
-      "mime-type": "text/x-fasta",
-      "optional": true,
-      "type": "per-sample"
-    },
-    "jaffa_results": {
-      "filepath": "jaffal_output_{{ alias }}/jaffa_results.csv",
-      "title": "Fusion transcript sequence summary file",
-      "description": "Fusion transcript sequences summary file output by Jaffa.",
-      "mime-type": "text/csv",
-      "optional": true,
-      "type": "per-sample"
     }
-   
   }
 }

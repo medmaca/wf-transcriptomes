@@ -1,886 +1,1675 @@
-#!/usr/bin/env python
-"""Create workflow report."""
+"""Create workflow report for wf-transcriptomes."""
 
-from collections import Counter, defaultdict, OrderedDict
+from html import escape
+import json
 import math
 import os
 from pathlib import Path
-import sys
+import warnings
 
-from aplanat import bars, hist
-from aplanat.components import simple as scomponents
-from aplanat.components.fastcat import read_length_plot, read_quality_plot
-from aplanat.report import WFReport
-from aplanat.util import Colors
-from bokeh.layouts import gridplot
-from bokeh.models import ColumnDataSource, Legend, Panel, Tabs
-from bokeh.models.widgets import DataTable, TableColumn
-from bokeh.palettes import Category10_10
-from bokeh.plotting import figure
-from bokeh.transform import dodge
-import gffutils
-import numpy as np
+from bokeh.resources import INLINE as BOKEH_INLINE
+from dominate.tags import (
+    br, div, h3, h4, p, pre, script, small, strong, style as dom_style
+)
+from dominate.util import raw
+from ezcharts.components import fastcat
+from ezcharts.components.ezchart import EZChart
+from ezcharts.components.reports import labs
+from ezcharts.components.theme import LAB_head_resources
+from ezcharts.layout.resource import Resource as EZC_Resource
+from ezcharts.layout.snippets import Tabs
+from ezcharts.layout.snippets.table import DataTable
 import pandas as pd
-import sigfig
+from .hierarchical_clustering import hierarchical, clustering_info   # noqa: ABS101
+from .util import get_named_logger, wf_parser  # noqa: ABS101
+from .volcano import volcano  # noqa: ABS101
 
-from . import de_plots  # noqa: ABS101
-from .util import wf_parser  # noqa: ABS101
-
-
-def argparser():
-    """Argument parser for entrypoint."""
-    parser = wf_parser("report")
-    parser.add_argument("--report", help="Report output file")
-    parser.add_argument("--stats", help="Read stats files.", nargs='+')
-    parser.add_argument(
-        "--versions", required=True,
-        help="directory containing CSVs containing name,version.")
-    parser.add_argument(
-        "--params", default=None, required=True,
-        help="A JSON file containing the workflow parameter key/values")
-    parser.add_argument(
-        "--revision", default='unknown',
-        help="git branch/tag of the executed workflow")
-    parser.add_argument(
-        "--commit", default='unknown',
-        help="git commit of the executed workflow")
-    parser.add_argument(
-        "--alignment_stats", required=False, default=None, nargs='*',
-        help="TSV summary file of alignment statistics")
-    parser.add_argument(
-        "--gff_annotation", required=False, nargs='+',
-        help="transcriptome annotation gff file")
-    parser.add_argument(
-        "--gffcompare_dir", required=False, default=None,
-        help="gffcompare outout dir")
-    parser.add_argument(
-        "--pychop_report", required=False, default=None,
-        help="TSV summary file of pychopper statistics")
-    parser.add_argument(
-        "--isoform_table", required=False, type=Path,
-        help="Path to directory of TSV files with isoform summaries")
-    parser.add_argument(
-        "--isoform_table_nrows", required=False, type=int, default=5000,
-        help="Maximum rows to display in isoforms table")
-    parser.add_argument(
-        "--jaffal_csv", required=False, type=str, default=None,
-        help="Path to JAFFAL results csv")
-    parser.add_argument(
-        "--de_report", required=False, type=str, default=None,
-        help="Differential expression report optional")
-    parser.add_argument(
-        "--de_stats", required=False, type=str, default=None, nargs='*',
-        help="Differential expression report optional")
-
-    return parser
+logger = get_named_logger("Report")
 
 
-def _parse_stat_line(sl):
-    """Parse a stats line."""
-    res = {}
-    tmp = sl.split(':')[1]
-    tmp = tmp.split('|')
-    res['sensitivity'] = float(tmp[0].strip())
-    res['precision'] = float(tmp[1].strip())
-    return res
+# Suppress asyncio deprecation warning triggered by dominate on Python 3.10+.
+# dominate calls asyncio.get_event_loop() outside a running async context.
+warnings.filterwarnings(
+    "ignore",
+    message="There is no current event loop",
+    category=DeprecationWarning,
+)
+
+classification_categories = {
+    "Full splice match": (
+        "Reference and query isoforms have the same number of exons and "
+        "all internal junctions agree."
+    ),
+    "Incomplete splice match": (
+        "Query isoform has fewer 5&prime; exons than the reference, with "
+        "matching internal junctions."
+    ),
+    "Novel in catalog": (
+        "No full or incomplete splice match, but uses a "
+        "combination of known donor/acceptor splice sites."
+    ),
+    "Novel not in catalog": (
+        "No full or incomplete splice match, with at least "
+        "one unannotated donor or acceptor splice site."
+    ),
+    "Antisense": (
+        "No same-strand reference overlap, but antisense to an "
+        "annotated gene."
+    ),
+    "Genic intron": (
+        "Query isoform is fully contained within an annotated intron."
+    ),
+    "Genic": "Query isoform overlaps introns and exons.",
+    "Intergenic": "Query isoform lies in an intergenic region.",
+}
+
+transcript_meta_dtypes = {
+    "TXNAME": "string",
+    "GENEID": "string",
+    "NDR": "Float64",
+    "novelGene": "boolean",
+    "novelTranscript": "boolean",
+    "txClassDescription": "string",
+    "readCount": "Int64",
+    "relReadCount": "Float64",
+    "relSubsetCount": "Float64",
+    "txid": "string",
+    "eqClassById": "string",
+    "gene_name": "string",
+    "transcript_name": "string"
+}
 
 
-def _parse_matching_line(line):
-    """Parse a metching line."""
-    tmp = line.split(':')[1].strip()
-    return int(tmp)
+def get_bokeh_widgets_js():
+    """Return the inline Bokeh widgets JavaScript bundle."""
+    widgets_index = BOKEH_INLINE.components_for("js").index("bokeh-widgets")
+    return raw(BOKEH_INLINE.js_raw[widgets_index])
 
 
-def _parse_mn_line(line):
-    """Parse a miss or novel line."""
-    res = {}
-    tmp = line.split(':')[1].strip()
-    tmp = tmp.split('/')
-    res['value'] = int(tmp[0])
-    tmp = tmp[1].split('(')
-    res['value_total'] = int(tmp[0].strip())
-    res['percent'] = float(tmp[1].split('%)')[0])
-    return res
+def get_bokeh_tables_js():
+    """Return the inline Bokeh tables JavaScript bundle."""
+    tables_index = BOKEH_INLINE.components_for("js").index("bokeh-tables")
+    return raw(BOKEH_INLINE.js_raw[tables_index])
 
 
-def _parse_total_line(line):
-    """Parse a total line."""
-    res = {}
-    tmp = line.split(':')[1].strip()
-    tmp = tmp.split('in')
-    res['transcripts'] = int(tmp[0].strip())
-    tmp = tmp[1].split('loci')
-    res['loci'] = int(tmp[0].strip())
-    tmp = int(tmp[1].split('(')[1].split(' ')[0])
-    res['me_transcripts'] = tmp
-    return res
+def _read_table(path, **kwargs):
+    """Read a TSV file into a DataFrame, returning None if path is absent."""
+    if path is None or not Path(path).exists():
+        return None
+    return pd.read_csv(path, sep="\t", **kwargs)
 
 
-def parse_gffcmp_stats(txt):
-    """Parse a gffcompare stats file.
+def _coerce_float(value):
+    """Return a finite float when possible, otherwise None."""
+    if value in (None, "", "N/A", "NA", "nan", "NaN"):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return numeric
 
-    :param txt: Path to the gffcompare stats file.
-    :returns: Return as tuple of dataframes containing:
-        perfromance statistics, match statistics, miss statistics,
-        novel statistics, total statistics.
-    :rtype: tuple
-    """
-    sensitivity = []
-    precision = []
-    level = []
 
-    matching = OrderedDict()
+def _format_count_value(value):
+    """Format count-like values for the report, tolerating NA-like strings."""
+    numeric = _coerce_float(value)
+    if numeric is None:
+        return "N/A"
+    return format(round(numeric), ",")
 
-    missed_level = []
-    missed = []
-    missed_total = []
-    missed_percent = []
 
-    novel_level = []
-    novel = []
-    novel_total = []
-    novel_percent = []
+def _format_ratio_value(value):
+    """Format ratio values for the report, tolerating NA-like strings."""
+    numeric = _coerce_float(value)
+    if numeric is None:
+        return "N/A"
+    return f"{numeric:.2f}x"
 
-    total_target = []
-    total_loci = []
-    total_transcripts = []
-    total_multiexonic = []
 
-    fh = open(txt, 'r')
-    for line in fh:
-        line = line.strip()
-        if len(line) == 0:
+def _sorted_transcript_abundance_table(tx_counts_file, sample_aliases):
+    """Get transcript abundance rows by descending total abundance of sample columns."""
+    dtype = transcript_meta_dtypes | {sample: "Float64" for sample in sample_aliases}
+    tx_counts = _read_table(tx_counts_file, dtype=dtype)
+
+    if tx_counts is None or tx_counts.empty:
+        return tx_counts
+    # Single sample data will not have 'readCount' column,
+    # so sort by the first sample alias counts instead.
+    sort_col = 'readCount' if 'readCount' in tx_counts.columns else sample_aliases[0]
+    return tx_counts.sort_values(sort_col, ascending=False)
+
+
+def _format_classification_label(name):
+    """Return canonical report label for a summary classification value."""
+    return str(name).strip().replace("-", "_").replace("_", " ").capitalize()
+
+
+def _transcriptome_summary(transcriptome_dir):
+    """Return transcriptome metrics and transcript class counts DataFrames."""
+    tx_meta = _read_table(
+        Path(transcriptome_dir) / "transcript_metadata.tsv",
+        dtype=transcript_meta_dtypes
+    )
+    if tx_meta is None:
+        return None, None
+
+    summary = {
+        "Transcripts": len(tx_meta),
+        "Genes": (
+            tx_meta["GENEID"].nunique() if "GENEID" in tx_meta.columns else "N/A"
+        ),
+    }
+    for column in ("newTxClass", "newGeneClass"):
+        if column in tx_meta.columns:
+            counts = tx_meta[column].fillna("NA").value_counts().head(10)
+            class_df = counts.rename_axis(column).reset_index(name="count")
+            return (
+                pd.DataFrame(summary.items(), columns=["Metric", "Value"]),
+                class_df,
+            )
+
+    return pd.DataFrame(summary.items(), columns=["Metric", "Value"]), None
+
+
+def _sample_summaries(samples_dir):
+    """Return a dict of per-sample metrics DataFrames keyed by sample name."""
+    summaries = {}
+    samples_path = Path(samples_dir)
+    if not samples_path.exists() or not samples_path.is_dir():
+        return summaries
+    for sample_dir in sorted(samples_path.iterdir()):
+        if not sample_dir.is_dir():
             continue
-        # Parse totals:
-        if line.startswith('#     Query mRNAs'):
-            total_target.append('Query')
-            r = _parse_total_line(line)
-            total_loci.append(r['loci'])
-            total_transcripts.append(r['transcripts'])
-            total_multiexonic.append(r['me_transcripts'])
-
-        if line.startswith('# Reference mRNAs '):
-            total_target.append('Reference')
-            r = _parse_total_line(line)
-            total_loci.append(r['loci'])
-            total_transcripts.append(r['transcripts'])
-            total_multiexonic.append(r['me_transcripts'])
-
-        # Parse basic statistics:
-        if line.startswith('Base level'):
-            st = _parse_stat_line(line)
-            level.append('Base')
-            sensitivity.append(st['sensitivity'])
-            precision.append(st['precision'])
-        if line.startswith('Exon level'):
-            st = _parse_stat_line(line)
-            level.append('Exon')
-            sensitivity.append(st['sensitivity'])
-            precision.append(st['precision'])
-        if line.startswith('Intron level'):
-            st = _parse_stat_line(line)
-            level.append('Intron')
-            sensitivity.append(st['sensitivity'])
-            precision.append(st['precision'])
-        if line.startswith('Intron chain level'):
-            st = _parse_stat_line(line)
-            level.append('Intron chain')
-            sensitivity.append(st['sensitivity'])
-            precision.append(st['precision'])
-        if line.startswith('Transcript level'):
-            st = _parse_stat_line(line)
-            level.append('Transcript')
-            sensitivity.append(st['sensitivity'])
-            precision.append(st['precision'])
-        if line.startswith('Locus level'):
-            st = _parse_stat_line(line)
-            level.append('Locus')
-            sensitivity.append(st['sensitivity'])
-            precision.append(st['precision'])
-
-        # Parse match statistics:
-        if line.startswith('Matching intron chains'):
-            m = _parse_matching_line(line)
-            matching['Intron chains'] = [m]
-        if line.startswith('Matching transcripts'):
-            m = _parse_matching_line(line)
-            matching['Transcripts'] = [m]
-        if line.startswith('Matching loci'):
-            m = _parse_matching_line(line)
-            matching['Loci'] = [m]
-
-        # Parse missing statistics:
-        if line.startswith('Missed exons'):
-            missed_level.append('Exons')
-            r = _parse_mn_line(line)
-            missed.append(r['value'])
-            missed_total.append(r['value_total'])
-            missed_percent.append(r['percent'])
-        if line.startswith('Missed introns'):
-            missed_level.append('Introns')
-            r = _parse_mn_line(line)
-            missed.append(r['value'])
-            missed_total.append(r['value_total'])
-            missed_percent.append(r['percent'])
-        if line.startswith('Missed loci'):
-            missed_level.append('Loci')
-            r = _parse_mn_line(line)
-            missed.append(r['value'])
-            missed_total.append(r['value_total'])
-            missed_percent.append(r['percent'])
-
-        # Parse novel statistics:
-        if line.startswith('Novel exons'):
-            novel_level.append('Exons')
-            r = _parse_mn_line(line)
-            novel.append(r['value'])
-            novel_total.append(r['value_total'])
-            novel_percent.append(r['percent'])
-        if line.startswith('Novel introns'):
-            novel_level.append('Introns')
-            r = _parse_mn_line(line)
-            novel.append(r['value'])
-            novel_total.append(r['value_total'])
-            novel_percent.append(r['percent'])
-        if line.startswith('Novel loci'):
-            novel_level.append('Loci')
-            r = _parse_mn_line(line)
-            novel.append(r['value'])
-            novel_total.append(r['value_total'])
-            novel_percent.append(r['percent'])
-
-    fh.close()
-
-    df_stats = pd.DataFrame(OrderedDict(
-        [('Sensitivity', sensitivity), ('Precision', precision)]), index=level)
-    df_match = pd.DataFrame(matching, index=['Matching'])
-
-    df_miss = pd.DataFrame(
-        OrderedDict(
-            [('Total', missed_total),
-             ('Missed', missed),
-             ('Percent missed', missed_percent)]), index=missed_level)
-
-    df_novel = pd.DataFrame(
-        OrderedDict(
-            [('Total', novel_total),
-             ('Novel', novel),
-             ('Percent novel', novel_percent)]), index=novel_level)
-
-    df_total = pd.DataFrame(OrderedDict(
-        [('Loci', total_loci), ('Transcripts', total_transcripts),
-         ('Multiexonic', total_multiexonic)]), index=total_target)
-
-    return df_stats, df_match, df_miss, df_novel, df_total
-
-
-def grouped_bar(df, title="", tilted_xlabs=False):
-    """Create grouped bar plot from pandas dataframe.
-
-    :param pandas.DataFrame
-        Index:
-            str: the x group labels - groups cluserted using these
-        Columns:
-           numeric: sub-groups of data - each sub group has same colour
-
-    :returns bokaoh.plotting.figure instance
-    """
-    min_ = 0
-    max_ = df.to_numpy().max()
-    max_ = max_ + (max_ * 0.3)  # Add some padding at top of plot for legends
-    yrange = int(min_), int(max_)
-
-    df['x_groups'] = df.index
-    df = df.reset_index(drop=True)
-    source = ColumnDataSource(data=df)
-
-    p = figure(
-        x_range=df['x_groups'], y_range=yrange, height=250, title=title,
-        toolbar_location=None, tools="")
-    i = 0
-    # Use the dodge method to plot groups of bars
-    # https://docs.bokeh.org/en/latest/docs/user_guide/categorical.html
-    dodge_range = (-0.25, 0.25)
-    current_dodge = dodge_range[0]
-    dodge_increment = abs(dodge_range[0] - dodge_range[1]) / \
-        (len(df.columns) - 1)
-
-    legend_it = []
-
-    if tilted_xlabs:
-        p.xaxis.major_label_orientation = math.pi / 4
-
-    for col in df.columns:
-
-        num_colors = df.shape[1] - 1
-        colors = list(zip(
-            *[[Category10_10[x]] * (len(df.columns) - 1)
-                for x in range(num_colors)]))
-        colors = [item for sublist in colors for item in sublist]
-
-        if col == 'x_groups':
+        tx_meta = _read_table(
+            sample_dir / "transcript_metadata.tsv",
+            dtype=transcript_meta_dtypes
+        )
+        if tx_meta is None:
             continue
-        color = colors[i]
-        i += 1
-
-        width = df.size / 60
-        v = p.vbar(
-            x=dodge('x_groups', current_dodge, range=p.x_range), top=col,
-            width=width, source=source, color=color)
-        current_dodge += dodge_increment
-        legend_it.append([col, [v]])
-
-    legend = Legend(items=legend_it)
-    p.add_layout(legend, 'right')
-    p.x_range.range_padding = 0.1
-    p.xgrid.grid_line_color = None
-    p.legend.location = "top_left"
-    p.legend.orientation = "vertical"
-    return p
+        summaries[sample_dir.name] = pd.DataFrame(
+            [
+                ("Transcripts", len(tx_meta)),
+                (
+                    "Genes",
+                    (
+                        tx_meta["GENEID"].nunique()
+                        if "GENEID" in tx_meta.columns
+                        else "N/A"
+                    ),
+                ),
+            ],
+            columns=["Metric", "Value"],
+        )
+    return summaries
 
 
-def gff_compare_plots(report, gffcompare_outdirs):
-    """Create various sections and plots in a WfReport.
+def _sqanti_table(sqanti_dir):
+    """Return a SQANTI3 classification summary DataFrame."""
+    rows = []
+    summaries = []
+    for root, _, files in os.walk(sqanti_dir, followlinks=True):
+        if "classification_summary.tsv" in files:
+            summaries.append(Path(root) / "classification_summary.tsv")
+    for summary in sorted(summaries):
+        table = _read_table(
+            summary,
+            dtype={
+                'structural_category': 'string',
+                'count': 'Int64'
+            }
+        )
+        if table is None or table.empty:
+            continue
 
-    :param report: aplanat WFReport
-    :param gffcompare_outdirs: List of output directories from run_gffcompare
-    :return: None
+        sample = summary.parent.name
 
-    TODO: split this into separate functions
-    """
-    # If any of the gffcompare dirs are empty, skip this section
-    if not all([any(Path(x).iterdir()) for x in gffcompare_outdirs]):
-        return
+        sample_counts = {"Sample": sample}
+        for _, row in table.iterrows():
+            feature = _format_classification_label(row["structural_category"])
+            count = _coerce_float(row["count"])
+            sample_counts[feature] = int(round(count)) if count is not None else 0
+        rows.append(sample_counts)
 
-    # Plot overview panel:
-    section = report.add_section()
-    gffcompare_md = ('''
-    ### Annotation summary
+    if not rows:
+        return None
 
-    The following plots summarize some of the output from
-    [gffcompare](https://ccb.jhu.edu/software/stringtie/gffcompare.shtml)
+    sqanti_df = pd.DataFrame(rows).fillna(0)
+    feature_cols = list(classification_categories.keys())
+    for col in feature_cols:
+        if col not in sqanti_df.columns:
+            sqanti_df[col] = 0
+        sqanti_df[col] = sqanti_df[col].astype(int)
+    sqanti_df = sqanti_df[["Sample"] + feature_cols]
+    is_cohort = sqanti_df["Sample"].str.lower().eq("cohort")
+    sqanti_df = sqanti_df.assign(_is_cohort=is_cohort)
+    return sqanti_df.sort_values(["_is_cohort", "Sample"]).drop(columns="_is_cohort")
 
-    * **Totals**:
-    Comparison of the number of stringtie-generated
-    transcripts, multiexonic transcripts and loci between reference and query.
 
-    * **Performance**:
-    How accurate are the query transcript annotations with respect to the
-    reference at various levels.
+def _sample_mod_summaries(summary_dir):
+    """Return a combined modified base summary table across all samples."""
+    if not summary_dir:
+        return None
+    summaries_path = Path(summary_dir)
+    if not summaries_path.exists() or not summaries_path.is_dir():
+        return None
+    summaries = []
+    for summary_file in sorted(summaries_path.glob("*.mods.summary.tsv")):
+        if not summary_file.is_file():
+            continue
+        summary = _read_table(
+            summary_file,
+            dtype={
+                "sample": "string",
+                "full_mod_code": "string",
+                "mod_label": "string",
+                "valid_coverage": "Int64",
+                "modified_calls": "Int64",
+                "modification_percent": "Float64"
+            },
+        )
+        if summary is None or summary.empty:
+            continue
+        if "sample" not in summary.columns:
+            raise ValueError(
+                f"Modified base summary is missing required 'sample' column: "
+                f"{summary_file}"
+            )
 
-    * **Missed**:
-    Features present in the reference, but absent in the query
+        sample_names = summary["sample"].unique()
+        if len(sample_names) != 1:
+            raise ValueError(
+                f"Modified base summary must contain exactly one sample name: "
+                f"{summary_file}"
+            )
 
-    * **Novel**:
-    Features present in the query transcripts, but absent in the reference
-    ''')
+        summary["mod"] = summary["mod_label"].where(
+            summary["mod_label"] != "",
+            summary["full_mod_code"],
+        )
+        summary = summary[
+            [
+                "sample",
+                "mod",
+                "full_mod_code",
+                "modification_percent",
+                "modified_calls",
+                "valid_coverage",
+            ]
+        ]
+        summaries.append(summary)
 
-    tabs = []
-    gff_fails = False
-    sample_ids = []
-    for dir_ in gffcompare_outdirs:
-        sample_id = dir_.name
-        sample_ids.append(sample_id)  # Get sample ids fromt the folder name
-        stats, _, miss, novel, total = \
-            parse_gffcmp_stats(dir_ / 'str_merged.stats')
+    if not summaries:
+        return None
 
-        if not any([x.empty for x in [stats, miss, novel, total]]):
-            bar_totals = grouped_bar(total, title="Totals")
-            bar_performance = grouped_bar(
-                stats, title="Performance", tilted_xlabs=True)
-            bar_missed = grouped_bar(miss, title="Missed")
-            bar_novel = grouped_bar(novel, title="Novel")
-            tabs.append(Panel(
-                child=gridplot(
-                    [bar_totals, bar_performance, bar_missed, bar_novel],
-                    ncols=2, width=350, height=260), title=sample_id))
-        else:
-            gff_fails = True
+    summary = pd.concat(summaries, ignore_index=True)
+    return summary.sort_values(["mod", "sample"]).reset_index(drop=True)
 
-    if gff_fails:
-        gffcompare_md += ('''
-                    __Warning__: Some gffcompare summary cannot be shown.
-                    This could be due to  incompatible reference fasta and gff
-                    files.''')
-    cover_panel = Tabs(tabs=tabs)
-    section.markdown(gffcompare_md)
-    section.plot(cover_panel)
 
-    names = {
-        '=': 'ExactMatch:=',
-        'c': 'Contained:c',
-        'k': 'ReverseContained:k',
-        'm': 'RetainedIntron:m',
-        'n': 'PartRetainedIntron:n',
-        'j': 'PartialMatch:j',
-        'e': 'TransFragMatch:e',
-        's': 'OppositeMatch:s',
-        'o': 'OtherSameStrand:o',
-        'x': 'ExonicOpposite:o',
-        'y': 'RefInIntrons:y',
-        'p': 'PolymeraseRunon:p',
-        'r': 'Repeat:r',
-        'u': 'Intergenic:u',
-        'i': 'FullyIntronic:i',
+def _render_mod_summary_matrix(summary):
+    """Render modified base summaries as a cross-sample comparison matrix."""
+    if summary.duplicated(["sample", "mod"]).any():
+        raise ValueError(
+            "Modified base summary contains duplicate sample/mod combinations."
+        )
+
+    samples = sorted(summary["sample"].astype(str).unique())
+    mods = sorted(summary["mod"].astype(str).unique())
+    lookup = {
+        (str(row.sample), str(row.mod)): row
+        for row in summary.itertuples(index=False)
     }
 
-    # Plot overlaps panel:
-    section = report.add_section()
-    section.markdown('''
-    ### Query transfrag classes
-
-    The classes that are assigned by
-    [gffcompare](https://ccb.jhu.edu/software/stringtie/gffcompare.shtml),
-    which describe the relationship between query transfrag and the most
-    similar reference transcript.
-
-    [This diagram](https://ccb.jhu.edu/software/stringtie/
-    gffcompare_codes.png) illustrates the different classes.
-    ''')
-
-    tracking_dfs = []
-
-    track_files = [x / 'str_merged.tracking' for x in gffcompare_outdirs]
-
-    df_tracking = load_data_add_sample_id(
-        track_files, sample_ids,
-        read_func=lambda x: pd.read_csv(
-            x, sep="\t", header=None,
-            usecols=[0, 3],
-            names=['Count', 'Overlaps']))
-
-    tabs = []
-    for id_, df_track in df_tracking.groupby('sample_id'):
-        tracking = df_track.groupby("Overlaps").count().reset_index()
-        tracking.Overlaps = tracking.Overlaps.map(names)
-        tracking['Percent'] = tracking.Count * 100 / tracking.Count.sum()
-        tracking = tracking.sort_values("Count", ascending=False)
-        track_bar = bars.simple_hbar(
-            list(reversed(tracking['Overlaps'].values.tolist())),
-            list(reversed(tracking['Percent'].values.tolist())),
-            colors=Colors.cerulean, title=id_)
-
-        tracking_dfs.append(tracking)
-
-        tracking['Description'] = pd.Series(tracking.Overlaps.apply(
-            lambda x: x.split(':')[0]))
-
-        tracking['Code'] = pd.Series(tracking.Overlaps.apply(
-            lambda x: x.split(':')[1]))
-
-        tracking.drop(columns=['sample_id', 'Overlaps'], inplace=True)
-        tracking = tracking[['Code', 'Description', 'Count', 'Percent']]
-        tracking = tracking.round({
-            'Percent': 2
-        })
-
-        cols = [TableColumn(
-            field=ci, title=ci, width=100) for ci in tracking.columns]
-
-        track_table = DataTable(
-            columns=cols, source=ColumnDataSource(tracking),
-            index_position=None, width=500)
-
-        tabs.append(Panel(
-            child=gridplot([track_bar, track_table], ncols=2), title=id_)
+    header_html = "".join(
+        f"<th>{escape(mod)}</th>" for mod in mods
+    )
+    body_rows = []
+    for sample in samples:
+        cells = []
+        for mod in mods:
+            row = lookup.get((sample, mod))
+            if row is None:
+                cells.append(
+                    "<td class='mod-summary-cell mod-summary-empty'>"
+                    "<div class='mod-summary-empty-mark'>&mdash;</div>"
+                    "</td>"
+                )
+                continue
+            cells.append(
+                "<td class='mod-summary-cell'>"
+                f"<div class='mod-summary-percent'>"
+                f"{_format_mod_summary_percent(row.modification_percent)}%"
+                f"</div>"
+                f"<div class='mod-summary-meta'>"
+                f"{_format_mod_summary_count(row.modified_calls)} modified"
+                f"</div>"
+                f"<div class='mod-summary-meta'>"
+                f"{_format_mod_summary_count(row.valid_coverage)} valid"
+                f"</div>"
+                "</td>"
+            )
+        body_rows.append(
+            "<tr>"
+            f"<th class='mod-summary-sample'>{escape(sample)}</th>"
+            + "".join(cells)
+            + "</tr>"
         )
 
-    cover_panel = Tabs(tabs=tabs)
-    section.plot(cover_panel)
-
-    def plot_isoforms_per_tpm_bin(
-            df_code, class_code, sample_id, geomspace=False):
-        """Make plots of number of isoforms per TPM coverage bin."""
-        max_ = int(sigfig.round(df_code.TPM.max(), 2))
-        if geomspace:
-            bins = [math.ceil(x) for x in np.geomspace(10, max_, num=15)]
-        else:
-            bins = np.linspace(10, max_, 15)
-        bins = np.unique(bins)  # Low max_ can end up with duplicated bins
-
-        groups = pd.cut(df_code.TPM, bins).value_counts()
-        df_code.to_csv('dfcode.csv')
-        df_temp = pd.DataFrame.from_dict(dict(
-            x=[x.mid for x in groups.index], y=groups.values
-        ))
-        df_temp.sort_values(by='x', inplace=True)
-
-        x = [str(math.ceil(x)) for x in df_temp.x]
-        y = df_temp.y
-
-        reads_per_iso_geom = \
-            bars.simple_bar(x, y,
-                            title="{} - Num isoforms/TPM bin - "
-                                  "gffcompare class code - '{}'".format(
-                                      sample_id, class_code),
-                            colors=Colors.cerulean,
-                            x_axis_label='TPM',
-                            y_axis_label='Number of isoforms')
-
-        reads_per_iso_geom.xaxis.major_label_orientation = math.pi / 2.8
-        return reads_per_iso_geom
-
-    log_plots = defaultdict(list)
-
-    try:
-        tmap_files = [next(x.glob('*.tmap')) for x in gffcompare_outdirs]
-    except StopIteration:
-        sys.stderr("Cannot find .tmap files in {}".format(gffcompare_outdirs))
-        return
-
-    df_tmap = load_data_add_sample_id(tmap_files, sample_ids)
-
-    for id_, df in df_tmap.groupby('sample_id'):
-
-        log_plots[id_].append(plot_isoforms_per_tpm_bin(
-            df, 'all', id_, geomspace=True))
-
-        for class_code, df_code in df.groupby('class_code'):
-            log_plots[id_].append(plot_isoforms_per_tpm_bin(
-                df_code, class_code, id_, geomspace=True))
-
-    tabs = []
-    for id_, sample_plots in log_plots.items():
-        tabs.append(Panel(
-            child=gridplot(sample_plots, ncols=2), title=id_))
-
-    section.markdown('''
-    ### Read coverage by gffcompare transfrag class''')
-    cover_panel = Tabs(tabs=tabs)
-    section.plot(cover_panel)
+    return (
+        "<div class='mod-summary-matrix-wrap'>"
+        "<table class='mod-summary-matrix'>"
+        "<thead><tr><th>Sample</th>"
+        f"{header_html}</tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody>"
+        "</table>"
+        "</div>"
+    )
 
 
-def pychopper_plots(report, pychop_report):
-    """Make plots from pychopper output.
+def _format_mod_summary_percent(value):
+    """Format a modified base percentage for display."""
+    return f"{float(value):.2f}"
 
-    :param report: aplanat WFReport
-    :param pychop_report: path to pychopper stats file
+
+def _format_mod_summary_count(value):
+    """Format a modified base count for display."""
+    return format(int(round(float(value))), ",")
+
+
+def _mod_summary_matrix_style():
+    """Return CSS for the modified base summary comparison matrix."""
+    return """
+    .mod-summary-matrix-wrap { overflow-x: auto; margin-bottom: 0.75rem; }
+    .mod-summary-matrix { width: 100%; border-collapse: collapse; }
+    .mod-summary-matrix th,
+    .mod-summary-matrix td {
+        border-bottom: 1px solid #e5e7eb;
+        padding: 0.75rem 0.875rem;
+        vertical-align: top;
+        text-align: left;
+    }
+    .mod-summary-matrix thead th {
+        font-weight: 600;
+        white-space: nowrap;
+    }
+    .mod-summary-sample {
+        white-space: nowrap;
+        font-weight: 600;
+    }
+    .mod-summary-percent {
+        font-size: 1.05rem;
+        font-weight: 700;
+        line-height: 1.2;
+    }
+    .mod-summary-meta {
+        margin-top: 0.15rem;
+        font-size: 0.8rem;
+        color: #6b7280;
+        line-height: 1.25;
+        white-space: nowrap;
+    }
+    .mod-summary-empty {
+        color: #9ca3af;
+    }
+    .mod-summary-empty-mark {
+        font-size: 1rem;
+        line-height: 1.2;
+    }
     """
-    section = report.add_section()
-    section.markdown('''
-    ### Pychopper summary statisitcs
-
-    The following plots summarize [pychopper] output
-    (https://github.com/epi2me-labs/pychopper)
-
-    * **Pr.found**: Reads with primers found in correct orientation at
-     both ends.
-    * **Resc**: Reads 'rescued' from fused reads
-    * **Unusable**: Read with missing or incorrect primer orientation
-    * **+/-**: Orientation of reads relative to the mRNA
-    ''')
-
-    plots = []
-    df = pd.read_csv(pychop_report, sep='\t', index_col=0)
-
-    for id_, df in df.groupby('sample_id'):
-        df1 = df.set_index('Name', drop=True)
-        df1 = df1.T[['Primers_found', 'Rescue', 'Unusable']]
-        df1.rename(columns={
-            'Primers_found': 'Pr.found',
-            'Rescue': 'Resc',
-            'Unusable': 'Un'}, inplace=True)
-        df2 = df[df.index == 'Strand']
-        bar_chop = bars.simple_bar(
-            df1.columns.values.tolist() + df2.Name.values.tolist(),
-            df1.iloc[0].values.tolist() + df2.Value.values.tolist(),
-            title='{} - Pychopper stats'.format(id_),
-            colors=Colors.cerulean)
-
-        plots.extend([bar_chop])
-    grid = gridplot(
-        plots, ncols=4, width=300, height=300)
-    section.plot(grid)
 
 
-def transcript_table(report, isoform_table, max_rows):
-    """Create searchable table of transcripts.
-
-    :param isoform_table: path to folder of isoform table files
-    """
-    section = report.add_section()
-
-    # Should we put data from each sample into it's own table or have it
-    # all in single table and sample_id column? Currently it's the latter
-
-    # drop some columns for the big table and do some filtering
-    section.markdown('''
-    ### Isoforms table
-
-    Table interactivity can be slow if too many isoforms are loaded. <br>
-    The number of isoform rows to load in this table can be set with
-    `isoform_table_nrows`. It is currently set to `{}`
-    '''.format(max_rows))
-
-    dfs = []
-    for file_ in Path(isoform_table).iterdir():
-        d = pd.read_csv(file_, sep='\t')
-        dfs.append(d)
-    df = pd.concat(dfs)
-
-    # Keep top n rows with most coverage
-    df.sort_values('cov', ascending=False, inplace=True)
-    df['cov'] = df['cov'].astype(int)
-    df = df.iloc[0: max_rows, :]
-
-    # Sort by transcripts with highest isoform diversity
-    df.sort_values('parent gene iso num', inplace=True, ascending=False)
-
-    section.table(df, index=False)
-
-
-def transcriptome_summary(report, gffs):
-    """
-    Plot transcriptome summaries.
-
-    Some of this data is available via gffcompare output, but the de novo
-    pipeline skips that, so we do it all here.
-
-    :param report: aplanat WFReport
-    :param gffs: list of paths to gff transcriptome annotations
-    """
-    # test.db gets written to the git repo.
-    section = report.add_section()
-    section.markdown('''
-    ### Transcriptome summary
-    ''')
-
-    tabs = []
-    for gff in gffs:
-        sample_id = Path(gff).name
-
-        plots = []
-
-        db = gffutils.create_db(
-            gff, dbfn=':memory:', force=True, keep_order=True,
-            merge_strategy='merge', sort_attribute_values=True
+def _contrast_results(de_dir, filename):
+    """Return a dict of per-contrast result DataFrames read from filename."""
+    tables = {}
+    for contrast_dir in sorted(Path(de_dir).iterdir()):
+        if not contrast_dir.is_dir():
+            continue
+        # Enforce str dtype in case of all Nan values.
+        table = _read_table(
+            contrast_dir / filename,
+            dtype={'gene_name': 'string', 'transcript_name': 'string'}
         )
+        if table is None or table.empty:
+            continue
 
-        num_transcripts = db.count_features_of_type('transcript')
-        num_genes = db.count_features_of_type('gene')
+        if 'gene_name' in table.columns:
+            table["gene_name"] = table["gene_name"].fillna("-")
+        if 'transcript_name' in table.columns:
+            table["transcript_name"] = table["transcript_name"].fillna("-")
 
-        transcript_lens = []
-        exons_per_transcript = Counter()
-        isoforms_per_gene = []
+        if "padj" in table.columns:
+            table.sort_values("padj", ascending=True, inplace=True)
+        tables[contrast_dir.name] = table
 
-        for g in db.features_of_type('gene'):
-
-            n_isos = len(list(db.children(g, featuretype='transcript')))
-            isoforms_per_gene.append(n_isos)
-
-            for t in db.children(
-                    g, featuretype='transcript', order_by='start'):
-                tr_len = 0
-                exons = list(enumerate(db.children(t, featuretype='exon')))
-                if len(exons) == 0:
-                    continue
-                for nx, ex in exons:
-                    tr_len += abs(ex.end - ex.start)
-
-                exons_per_transcript[nx] += 1
-
-                transcript_lens.append(tr_len)
-
-        bar_isos = hist.histogram(
-            [isoforms_per_gene], colors=[Colors.cerulean],
-            title="isoforms per gene", binwidth=1)
-        bar_isos.xaxis.axis_label = "Num. isoforms"
-        bar_isos.yaxis.axis_label = "Num. genes"
-
-        bar_isos.xaxis.major_label_orientation = math.pi / 2.8
-        plots.append(bar_isos)
-
-        box = bars.boxplot_series(
-            [sample_id] * len(transcript_lens), transcript_lens,
-            width=70, ylim=(min(transcript_lens), max(transcript_lens)),
-            title='transcript lengths')
-        plots.append(box)
-
-        x, y = zip(*sorted(exons_per_transcript.items()))
-
-        fig = figure(title="Exons per transcript")
-        fig.vbar(
-            x, top=list(y), color=Colors.cerulean)
-        fig.xaxis.axis_label = 'Num. exons'
-        fig.yaxis.axis_label = 'Num. genes'
-
-        fig.xaxis.major_label_orientation = math.pi / 2.8
-        plots.append(fig)
-
-        df_sum = pd.DataFrame.from_dict(
-            {'Total genes': [num_genes],
-             'Total transcripts': [num_transcripts],
-             'Max trans. len': max(transcript_lens),
-             'Min trans. len': min(transcript_lens)}).T
-        df_sum.reset_index(drop=False, inplace=True)
-
-        df_sum.columns = [' ', 'count']
-        cols = [TableColumn(
-            field=ci, title=ci, width=80) for ci in df_sum.columns]
-        data_table = DataTable(
-            columns=cols, source=ColumnDataSource(df_sum),
-            index_position=None, width=180)
-        plots.append(data_table)
-
-        tabs.append(Panel(
-            child=gridplot(plots, ncols=4,
-                           width=300, height=300), title=sample_id))
-
-    cover_panel = Tabs(tabs=tabs)
-    section.plot(cover_panel)
+    return tables
 
 
-def load_data_add_sample_id(files, sample_ids, read_func=None):
-    """Load CSVs and concat into single into dataframe, and assign sample_id column."""
-    df_ = pd.DataFrame()
-    if not files:
+def _round_de_table(table):
+    """Return a display-formatted copy of a DE/DTU result table."""
+    rounded_columns = [
+        "baseMean", "exonBaseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj"
+    ]
+
+    def _format_numeric(value):
+        numeric_value = pd.to_numeric(value, errors="coerce")
+        if pd.isna(numeric_value):
+            return value
+        fixed_decimal = f"{numeric_value:.3f}"
+        if numeric_value != 0 and (
+            abs(numeric_value) < 0.0001 or fixed_decimal in {"0.000", "-0.000"}
+        ):
+            return f"{numeric_value:.3e}"
+        return fixed_decimal
+
+    rounded = table.copy()
+    for column in rounded_columns:
+        if column not in rounded.columns:
+            continue
+        rounded[column] = rounded[column].map(_format_numeric)
+    return rounded
+
+
+def _load_bambu_qc(bambu_dir):
+    """Load bambu QC statistics JSON."""
+    qc_file = Path(bambu_dir) / "bambu_qc_stats.json"
+    if qc_file.exists():
+        with open(qc_file) as f:
+            return json.load(f)
+    return None
+
+
+def _load_annotation_reference_summary(summary_file):
+    """Load reference/annotation preparation summary JSON from a file path."""
+    if summary_file is None:
         return None
-    for id_, x in zip(sample_ids, files):
-        if read_func:
-            d = read_func(x)
-        else:
-            d = pd.read_csv(x, sep='\t+')
-        d['sample_id'] = id_
-        df_ = pd.concat([df_, d])
-    return df_
+    summary_path = Path(summary_file)
+    if summary_path.exists():
+        with open(summary_path) as f:
+            return json.load(f)
+    return None
 
 
-def seq_stats_tabs(report, stats):
-    """Make tabs of sequence summaries by sample."""
-    tabs = {}
-    for summary_fn in stats:
-        df_sample = pd.read_csv(summary_fn, sep="\t")
-        sample_id = df_sample['sample_name'].iloc[0]
-        rlp = read_length_plot(df_sample)
-        rqp = read_quality_plot(df_sample)
-        grid = gridplot(
-            [rlp, rqp], ncols=2, sizing_mode="stretch_width")
-        tabs[sample_id] = Panel(child=grid, title=sample_id)
-    section = report.add_section()
-    section.markdown("""
-    ### Sequence summaries""")
-    section.plot(Tabs(tabs=[tabs.get(x) for x in sorted(tabs)]))
+def _load_de_qc(de_dir):
+    """Load DE/DTU QC statistics JSON."""
+    qc_file = Path(de_dir) / "de_qc_stats.json"
+    if qc_file.exists():
+        with open(qc_file) as f:
+            return json.load(f)
+    return None
 
 
-def jaffal_table(report, result_csv):
-    """Make a table of fusion transcripts identified by JAFFAL."""
-    cols = [
-        'sample_id', 'fusion genes', 'chrom1', 'chrom2', 'spanning reads',
-        'classification', 'known']
+def _load_cpm_tables(cohort_dir, sample_aliases):
+    """Load cohort-level gene and transcript CPM tables."""
+    cohort_dir = Path(cohort_dir)
+    gene_columns = ["GENEID", *sample_aliases]
+    transcript_columns = ["TXNAME", *sample_aliases]
 
-    section = report.add_section()
-    try:
-        df = pd.read_csv(result_csv)
-    except pd.errors.EmptyDataError:
-        section.markdown("""
-        ### JAFFAL fusion transcript summary
+    gene_cpm = _read_table(
+        cohort_dir / "gene_cpm.tsv",
+        dtype={
+            "GENEID": "string",
+            **{sample: "Float64" for sample in sample_aliases},
+        },
+        usecols=gene_columns,
+    )
 
-        This section summarizes putative fusion transcripts identified
-        by [JAFFAL](https://github.com/Oshlack/JAFFA/).
+    if gene_cpm is None or gene_cpm.empty:
+        gene_cpm = None
 
-        No fusion transcripts were detected for any of the samples.
-        """)
-    else:
-        sid_col = df.pop('sample_id')
-        df.insert(0, 'sample_id', sid_col)
+    transcript_cpm = _read_table(
+        cohort_dir / "transcript_cpm.tsv",
+        dtype={
+            "TXNAME": "string",
+            **{sample: "Float64" for sample in sample_aliases},
+        },
+        usecols=transcript_columns,
+    )
+    if transcript_cpm is None or transcript_cpm.empty:
+        transcript_cpm = None
 
-        df = df[cols]
-        df['chroms'] = df.chrom1.astype(str) + ':' + df.chrom2.astype(str)
-        df.rename(columns={
-            'spanning reads': 'nreads',
-            'fusion genes': 'genes'}, inplace=True)
-        df.drop(columns=['chrom1', 'chrom2'], inplace=True)
-
-        section.markdown("""
-        ### JAFFAL fusion transcript summary
-
-        This table summarizes putative fusion transcripts identified
-        by [JAFFAL](https://github.com/Oshlack/JAFFA/).
-
-        * genes: the gene symbols of the fusion partners
-        * nreads: The number of reads supporting the fusion
-        * classification: JAFFAL's classification
-        * known: whether this fusion is in the given set of known gene fusions
-        * chroms: the respective, original chromosome location of the
-        two partner genes
-        """)
-        section.table(df)
+    return {
+        "gene": gene_cpm,
+        "transcript": transcript_cpm,
+    }
 
 
-def de_section(report):
-    """Make differential transcript expression section."""
-    dexseq = os.path.join("de_report", "results_dexseq.tsv")
-    dge = os.path.join("de_report", "results_dge.tsv")
-    dtu = os.path.join("de_report", "results_dtu_stageR.tsv")
-    stringtie = os.path.join("de_report", "stringtie_merged.gtf")
-    tpm = os.path.join("de_report", "unfiltered_tpm_transcript_counts.tsv")
-    filtered = os.path.join(
-        "de_report", "filtered_transcript_counts_with_genes.tsv")
-    unfiltered = os.path.join(
-        "de_report", "unfiltered_transcript_counts_with_genes.tsv")
-    gene_counts = os.path.join("de_report", "all_gene_counts.tsv")
-    # This will also add a gene name column to the above counts tsv files
-    de_plots.de_section(
-        stringtie=stringtie,
-        dexseq=dexseq,
-        dge=dge,
-        dtu=dtu,
-        tpm=tpm,
-        report=report,
-        filtered=filtered,
-        unfiltered=unfiltered,
-        gene_counts=gene_counts)
+def _load_cohort_samples(cohort_dir):
+    """Load cohort sample metadata CSV."""
+    sample_file = Path(cohort_dir) / "samples.csv"
+    if not sample_file.exists():
+        return None
+    return pd.read_csv(sample_file, dtype='string')
+
+
+def _format_hint_values(hints):
+    """Format provenance hints for a compact table cell."""
+    if not hints:
+        return "None detected"
+    return ", ".join(hints)
+
+
+def _create_warning_banner(message, level="warning"):
+    """Create a styled warning banner."""
+    alert_level = level if level in {"warning", "danger", "info"} else "warning"
+    icon = (
+        "⚠️"
+        if alert_level == "warning"
+        else "❌"
+        if alert_level == "danger"
+        else "ℹ️"
+    )
+    with div(
+        cls=f"alert alert-{alert_level}",
+        role="alert",
+        style="white-space: pre-line;",
+    ):
+        raw(f"<strong>{icon}</strong> {escape(message)}")
+
+
+def _heatmap_style():
+    return """
+        .heatmap-table-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 20px 10px;
+            align-items: start;
+        }
+        .heatmap-table-grid > * {
+            min-width: 0;
+        }
+        @media screen and (max-width: 1000px) {
+            .heatmap-table-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        .info-text {
+            font-size: 11px;
+        }"""
+
+
+def _volcano_style():
+    return """
+        .volcano-plot-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(430px, 34%);
+            gap: 18px;
+            align-items: start;
+        }
+        .volcano-plot-grid > *,
+        .volcano-side-panel > * {
+            min-width: 0;
+        }
+        .volcano-side-panel {
+            display: grid;
+            gap: 10px;
+            align-items: start;
+        }
+        @media screen and (max-width: 1100px) {
+            .volcano-plot-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        """
+
+
+def _as_string_list(value):
+    """Normalize optional values to a compact list of strings."""
+    if value is None or value == "none":
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if item not in (None, "")]
+    if isinstance(value, str):
+        return [value] if value else []
+    return [str(value)]
+
+
+def _collect_de_method_rows(de_qc):
+    """Build per-contrast method rows and warning metadata."""
+    rows = []
+    deseq2_gene_wise = []
+    dexseq_gene_wise = []
+    dexseq_covariate_drops = []
+    failed_dge = []
+
+    for contrast_name, contrast_data in de_qc.get("contrasts", {}).items():
+        fallback = contrast_data.get("deseq2_dispersion_fallback") or {}
+        fallback_applied = bool(fallback.get("applied", False))
+        deseq2_method = fallback.get("method_used")
+        deseq2_size_factors = contrast_data.get("deseq2_size_factor_method") or "ratio"
+
+        if not deseq2_method:
+            deseq2_method = "gene-wise" if fallback_applied else "parametric"
+
+        if deseq2_method == "gene-wise":
+            deseq2_gene_wise.append(contrast_name)
+
+        dexseq_method = contrast_data.get("dexseq_dispersion_method") or "parametric"
+        dexseq_size_factors = contrast_data.get("dexseq_size_factor_method") or "ratio"
+        if dexseq_method == "gene-wise":
+            dexseq_gene_wise.append(contrast_name)
+
+        dropped_covariates = _as_string_list(
+            contrast_data.get("dexseq_covariates_dropped")
+        )
+        if dropped_covariates:
+            dexseq_covariate_drops.append((contrast_name, dropped_covariates))
+
+        if contrast_data.get("dge_status") == "FAILED":
+            failed_dge.append(contrast_name)
+
+        rows.append(
+            {
+                "Contrast": contrast_name,
+                "DESeq2 size factors": deseq2_size_factors,
+                "DESeq2 dispersion": (
+                    f"{deseq2_method} (fallback)"
+                    if fallback_applied
+                    else deseq2_method
+                ),
+                "DEXSeq size factors": dexseq_size_factors,
+                "DEXSeq dispersion": dexseq_method,
+                "DEXSeq covariates dropped": (
+                    ", ".join(dropped_covariates) if dropped_covariates else "none"
+                ),
+                "DGE status": contrast_data.get("dge_status", "N/A"),
+                "DTU status": contrast_data.get("dtu_status", "N/A"),
+            }
+        )
+
+    return rows, deseq2_gene_wise, dexseq_gene_wise, dexseq_covariate_drops, failed_dge
 
 
 def main(args):
-    """Run the entry point."""
-    report = WFReport(
-        "Transcript isoform report", "wf-transcriptomes",
-        revision=args.revision, commit=args.commit)
+    """Run the report entry point."""
+    logger = get_named_logger("Report")
+    report = labs.LabsReport(
+        "Transcriptomes Sequencing report",
+        "wf-transcriptomes",
+        args.params,
+        args.versions,
+        args.wf_version,
+        head_resources=[
+            *LAB_head_resources,
+            EZC_Resource(func=get_bokeh_widgets_js, tag=script),
+            EZC_Resource(func=get_bokeh_tables_js, tag=script)]
+    )
 
-    seq_stats_tabs(report, args.stats)
+    with open(args.metadata, "r") as handle:
+        metadata = json.load(handle)
+    sample_aliases = [item["alias"] for item in metadata]
 
-    if args.alignment_stats is not None:
-        stats_dfs = []
-        for stats_file in args.alignment_stats:
-            df = pd.read_csv(stats_file, sep='\t+')
-            stats_dfs.append(df)
-        aln_stats_df = pd.concat(stats_dfs)
-        section = report.add_section()
-        section.markdown('''
-          ### Read mapping summary
+    if args.stats:
+        with report.add_section("Read summary", "Reads"):
+            p(
+                "Read quality and alignment statistics generated by fastcat bamstats "
+                "for each input sample. Shown are distributions of read "
+                "length and quality score, and a summary of alignment "
+                "outcomes (mapped, unmapped, primary, supplementary) "
+                "against the reference genome."
+            )
+            stats = tuple(args.stats)
+            sample_names = tuple(
+                item["alias"] for item in metadata if item.get("has_stats")
+            )
+            flagstats = tuple(
+                Path(stats_dir) / "bamstats.flagstat.tsv" for stats_dir in stats
+            )
+            if len(stats) == 1:
+                stats = stats[0]
+                flagstats = flagstats[0]
+                sample_names = sample_names[0] if sample_names else None
+            try:
+                fastcat.SeqSummary(
+                    stats,
+                    flagstat=flagstats,
+                    sample_names=sample_names,
+                    alignment_stats=True,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Skipping read summary plot: %s", exc)
+                _create_warning_banner(
+                    (
+                        "Read summary plots could not be rendered for this run. "
+                        "This can happen for degenerate or extremely "
+                        "small input statistics."
+                    ),
+                    level="info",
+                )
 
-          Summary of minimap2 mapping from
-          [seqkit](https://bioinf.shenwei.me/seqkit/)
-          `seqkit bam -s`''')
+    with report.add_section("Sample metadata", "Samples"):
+        p(
+            "Metadata for each input sample as parsed from the sample sheet "
+            "and workflow parameters. Includes the sample alias, barcode, "
+            "type, and any experimental design columns such as condition or "
+            "batch that were supplied for differential analysis."
+        )
+        tabs = Tabs()
+        for item in sorted(metadata, key=lambda value: value["alias"]):
+            with tabs.add_tab(item["alias"]):
+                DataTable.from_pandas(
+                    pd.DataFrame.from_dict(item, orient="index", columns=["Value"])
+                    .reset_index()
+                    .rename(columns={"index": "Field"}),
+                    use_index=False,
+                )
+    mod_summaries = _sample_mod_summaries(args.mod_summary_dir)
+    if mod_summaries is not None and not mod_summaries.empty:
+        with report.add_section("Modified base summaries", "Modifications"):
+            p(
+                "Summary of base modification calls from modkit pileup for each "
+                "combination of sample and modification type."
+            )
+            dom_style(raw(_mod_summary_matrix_style()))
+            raw(_render_mod_summary_matrix(mod_summaries))
+            small(raw(
+                "<b>Valid coverage</b> Sum of the valid residues: all the "
+                "modified, canonical and other mod (where the modification "
+                "is different from the listed base) bedMethyl columns "
+                "counts for this combination of sample and mod. "
+                "<b>Modified calls</b> Number of calls passing filters "
+                "that were classified as a residue with a specified base "
+                "modification. "
+                "<b>Modification percent</b> (Modified calls / Valid "
+                "coverage) * 100"
+            ))
 
-        section.table(aln_stats_df)
+    annotation_reference_summary = _load_annotation_reference_summary(args.ref_summary)
 
-    if args.pychop_report is not None:
-        pychopper_plots(report, args.pychop_report)
+    if annotation_reference_summary:
+        with report.add_section("Reference and Annotation Checks", "Reference"):
+            p(
+                "Results of compatibility checks between the supplied reference "
+                "genome and annotation performed before bambu transcript "
+                "modelling. "
+                "Build and provider hints are inferred from sequence names and "
+                "file content to help identify mismatched genome/annotation "
+                "combinations."
+            )
+            for warning in annotation_reference_summary.get("warnings", []):
+                _create_warning_banner(
+                    warning,
+                    level="info" if warning.startswith("Info:") else "warning",
+                )
 
-    # Results
-    if args.gff_annotation is not None:
-        transcriptome_summary(report, args.gff_annotation)
+            seqname_rows = [
+                (
+                    "Overlapping seqnames",
+                    _format_count_value(
+                        len(annotation_reference_summary.get("seqname_overlap", []))
+                    ),
+                ),
+                (
+                    "Seqnames only in annotation",
+                    _format_count_value(
+                        len(
+                            annotation_reference_summary.get(
+                                "only_in_annotation", []
+                            )
+                        )
+                    ),
+                ),
+                (
+                    "Seqnames only in reference",
+                    _format_count_value(
+                        len(
+                            annotation_reference_summary.get(
+                                "only_in_reference", []
+                            )
+                        )
+                    ),
+                ),
+            ]
+            annotation_summary = annotation_reference_summary.get("annotation", {})
+            gff_conversion = annotation_reference_summary.get("gff_conversion", {})
+            if annotation_summary.get("was_gff"):
+                seqname_rows.extend([
+                    (
+                        "Seqnames only in GFF (pruned during GTF conversion)",
+                        _format_count_value(
+                            len(annotation_reference_summary.get("only_in_gff", []))
+                        ),
+                    ),
+                ])
+            annotation_rows = [
+                (
+                    "Transcript annotation records retained",
+                    _format_count_value(annotation_summary.get("kept_records")),
+                ),
+                (
+                    "Unstranded records excluded",
+                    _format_count_value(
+                        annotation_summary.get("excluded_unstranded_records")
+                    ),
+                ),
+                (
+                    "Transcript annotation attributes sanitised",
+                    _format_count_value(
+                        annotation_summary.get("sanitised_attribute_records")
+                    ),
+                ),
+            ]
+            if annotation_summary.get("was_gff"):
+                annotation_rows.append(
+                    (
+                        "Non-transcript records excluded "
+                        "(pruned during GTF conversion)",
+                        _format_count_value(gff_conversion.get("pruned_count")),
+                    ),
+                )
+            with div(cls="row"):
+                with div(cls="col-md-6"):
+                    DataTable.from_pandas(
+                        pd.DataFrame(seqname_rows, columns=["Check", "Value"]),
+                        paging=False,
+                        searchable=False,
+                        use_index=False,
+                    )
+                with div(cls="col-md-6"):
+                    DataTable.from_pandas(
+                        pd.DataFrame(annotation_rows, columns=["Check", "Value"]),
+                        paging=False,
+                        searchable=False,
+                        use_index=False,
+                    )
 
-    if args.gffcompare_dir is not None:
-        gff_compare_plots(
-            report,
-            [x for x in Path(args.gffcompare_dir).iterdir()])
+            h4("Build and Provider Hints")
+            hint_rows = [
+                (
+                    "Reference build",
+                    _format_hint_values(
+                        annotation_reference_summary.get(
+                            "reference_build_hints", []
+                        )
+                    ),
+                ),
+                (
+                    "Annotation build",
+                    _format_hint_values(
+                        annotation_reference_summary.get(
+                            "annotation_build_hints", []
+                        )
+                    ),
+                ),
+                (
+                    "Reference provider",
+                    _format_hint_values(
+                        annotation_reference_summary.get(
+                            "reference_provider_hints", []
+                        )
+                    ),
+                ),
+                (
+                    "Annotation provider",
+                    _format_hint_values(
+                        annotation_reference_summary.get(
+                            "annotation_provider_hints", []
+                        )
+                    ),
+                ),
+            ]
+            DataTable.from_pandas(
+                pd.DataFrame(hint_rows, columns=["Evidence", "Hints"]),
+                paging=False,
+                searchable=False,
+                use_index=False,
+            )
 
-    if args.isoform_table is not None:
-        transcript_table(report, args.isoform_table, args.isoform_table_nrows)
+            examples = annotation_summary.get("unstranded_examples") or []
+            if examples:
+                h4("Unstranded Annotation Examples")
+                pre("\n".join(examples))
 
-    if args.de_report:
-        de_section(report)
+    # Setup for using cohort or single sample bambu results
+    is_single_sample = len(metadata) == 1
+    primary_label = metadata[0]["alias"] if is_single_sample else "Cohort"
 
-    if args.jaffal_csv:
-        jaffal_table(report, args.jaffal_csv)
+    # Load bambu QC statistics
+    bambu_dir = (
+        Path(args.samples_dir) / metadata[0]["alias"] if is_single_sample
+        else args.cohort_dir
+    )
+    bambu_qc = _load_bambu_qc(bambu_dir)
+    # Add Bambu QC section with warnings
+    if bambu_qc:
+        with report.add_section("Bambu Quality Control", "Bambu QC"):
+            p(
+                "Quality metrics from the bambu transcript discovery and "
+                "quantification run. Library size statistics show cohort-level "
+                "summary values to "
+                "flag large inter-sample variation that could affect CPM "
+                "normalisation, with the individual per-sample counts listed "
+                "below. The transcript discovery table shows the transcriptome "
+                "mode used, the novel discovery rate (NDR) threshold applied, "
+                "and how many transcripts were present before and after "
+                "low-count filtering."
+            )
+            # Check for warnings
+            if bambu_qc.get("library_size_warning"):
+                _create_warning_banner(
+                    f"Library Size Variation: {bambu_qc['library_size_warning']}. "
+                    "Large variation (>3x) may affect CPM normalization. "
+                    "Consider reviewing per-sample library sizes.",
+                    level="warning",
+                )
 
-    # Arguments and software versions
-    report.add_section(
-        section=scomponents.version_table(args.versions))
-    report.add_section(
-        section=scomponents.params_table(args.params))
+            h4("Library Size Statistics")
+            lib_stats = pd.DataFrame(
+                [
+                    ("Samples analyzed", bambu_qc.get("samples", "N/A")),
+                    (
+                        "Median library size",
+                        "{} reads".format(
+                            _format_count_value(
+                                bambu_qc.get("median_library_size", 0)
+                            )
+                        ),
+                    ),
+                    (
+                        "Min library size",
+                        "{} reads".format(
+                            _format_count_value(
+                                bambu_qc.get("min_library_size", 0)
+                            )
+                        ),
+                    ),
+                    (
+                        "Max library size",
+                        "{} reads".format(
+                            _format_count_value(
+                                bambu_qc.get("max_library_size", 0)
+                            )
+                        ),
+                    ),
+                    (
+                        "Library size ratio (max/min)",
+                        _format_ratio_value(
+                            bambu_qc.get("library_size_ratio", 1.0)
+                        ),
+                    ),
+                ],
+                columns=["Metric", "Value"],
+            )
+            DataTable.from_pandas(
+                lib_stats,
+                paging=False,
+                searchable=False,
+                use_index=False,
+            )
+
+            # Transcript discovery statistics
+            h4("Transcript Discovery")
+            discovery_stats = pd.DataFrame(
+                [
+                    (
+                        "Transcriptome mode",
+                        bambu_qc.get("transcriptome_mode", "N/A"),
+                    ),
+                    ("NDR used", str(bambu_qc.get("ndr_used", "N/A"))),
+                    (
+                        "Transcripts before filtering",
+                        bambu_qc.get("total_transcripts_before_filter", 0),
+                    ),
+                    (
+                        "Transcripts after filtering",
+                        bambu_qc.get("total_transcripts_after_filter", 0),
+                    ),
+                    (
+                        "Transcripts removed",
+                        bambu_qc.get("transcripts_filtered", 0),
+                    ),
+                    (
+                        "Median transcripts per sample",
+                        bambu_qc.get("median_transcripts_detected", 0),
+                    ),
+                    (
+                        "Unique genes (after filter)",
+                        bambu_qc.get("total_genes_after_filter", 0),
+                    ),
+                ],
+                columns=["Metric", "Value"],
+            )
+            DataTable.from_pandas(
+                discovery_stats,
+                paging=False,
+                searchable=False,
+                use_index=False,
+            )
+
+            # Per-sample library sizes
+            if "library_sizes" in bambu_qc and bambu_qc["library_sizes"]:
+                h4("Per-Sample Library Sizes")
+                lib_size_data = []
+                for sample, size in bambu_qc["library_sizes"].items():
+                    numeric_size = _coerce_float(size)
+                    lib_size_data.append(
+                        {
+                            "Sample": sample,
+                            "Library Size": _format_count_value(size),
+                            "Reads": (
+                                numeric_size if numeric_size is not None else -1
+                            ),
+                        }
+                    )
+                lib_df = pd.DataFrame(lib_size_data).sort_values(
+                    "Reads", ascending=False
+                )
+                DataTable.from_pandas(
+                    lib_df[["Sample", "Library Size"]],
+                    paging=False,
+                    use_index=False,
+                )
+
+    with report.add_section(
+        f"{primary_label} transcriptome",
+        f"{primary_label} transcriptome"
+    ):
+        p(
+            f"Summary of the "
+            f"{'per-sample' if is_single_sample else 'joint cohort'} bambu "
+            "transcriptome model. Shows the total number of transcripts and "
+            "genes in the final model, and "
+            f"the top 500 rows of the transcript abundance count table."
+        )
+        transcriptome_metrics, transcriptome_classes = _transcriptome_summary(bambu_dir)
+        if transcriptome_metrics is not None:
+            DataTable.from_pandas(
+                transcriptome_metrics,
+                paging=False,
+                searchable=False,
+                use_index=False,
+            )
+        if transcriptome_classes is not None:
+            DataTable.from_pandas(
+                transcriptome_classes,
+                paging=False,
+                searchable=False,
+                use_index=False,
+            )
+
+        tx_counts = _sorted_transcript_abundance_table(
+            Path(bambu_dir) / "transcript_counts.tsv",
+            sample_aliases
+        )
+        if tx_counts is not None and not tx_counts.empty:
+            p(
+                f"Top {args.de_table_size} most abundant transcripts"
+            )
+            DataTable.from_pandas(tx_counts.head(args.de_table_size), use_index=False)
+        else:
+            _create_warning_banner("No trancrips discovered")
+
+    if not is_single_sample:
+        with report.add_section(
+            "Per-sample transcriptomes",
+            "Per-sample transcriptomes"
+        ):
+            p(
+                "Per-sample transcript and gene count summaries derived from "
+                "the individual bambu quantification runs. Each tab shows the "
+                "number of transcripts and genes detected in that sample after "
+                "filtering. These can be used to spot samples with unusually "
+                "low transcript detection compared to the rest of the cohort."
+            )
+            tabs = Tabs()
+            for sample, summary_df in _sample_summaries(args.samples_dir).items():
+                with tabs.add_tab(sample):
+                    DataTable.from_pandas(
+                        summary_df,
+                        paging=False,
+                        searchable=False,
+                        use_index=False,
+                    )
+
+    sqanti_table = _sqanti_table(args.sqanti_dir)
+    if sqanti_table is not None and not sqanti_table.empty:
+        with report.add_section("SQANTI3 classification", "SQANTI3"):
+            p(
+                "Structural classification of transcript isoforms by SQANTI3. "
+                "Each transcript is assigned a category based on how its "
+                "splice junctions and exon structure compared to the reference "
+                "annotation. The table shows the count of "
+                "transcripts in each category per sample and for "
+                "the whole cohort."
+            )
+            DataTable.from_pandas(sqanti_table, use_index=False)
+            with p():
+                for category, description in classification_categories.items():
+                    small(strong(f"{category}: "))
+                    small(raw(f"{description}<br>"))
+
+    if args.de_dir and Path(args.de_dir).exists():
+        # Load DE QC statistics
+        de_qc = _load_de_qc(args.de_dir)
+
+        # Add DE/DTU QC section with warnings
+        if de_qc:
+            with report.add_section(
+                "Differential Analysis Quality Control",
+                "DE/DTU QC",
+            ):
+                p(
+                    "Quality control summary for the differential expression "
+                    "analyses. Shows the experimental design "
+                    "and the number of samples per group. For each contrast, "
+                    "the statistical methods chosen by DESeq2 and DEXSeq are "
+                    "reported , including the dispersion estimation strategy "
+                    "(parametric or gene-wise fallback) and size factor "
+                    "normalisation method, alongside the analysis status and "
+                    "count of significant hits. Any warnings about low sample "
+                    "numbers, dispersion fallbacks, dropped covariates, or "
+                    "analysis failures are highlighted here."
+                )
+                # Check for critical warnings
+                has_warnings = False
+                sample_size_warnings = _as_string_list(
+                    de_qc.get("sample_size_warnings")
+                )
+                (
+                    method_rows,
+                    deseq2_gene_wise,
+                    dexseq_gene_wise,
+                    dexseq_covariate_drops,
+                    failed_dge,
+                ) = _collect_de_method_rows(de_qc)
+
+                if sample_size_warnings:
+                    _create_warning_banner(
+                        "Sample Size Warning: "
+                        + "; ".join(sample_size_warnings)
+                        + ". "
+                        "Underpowered designs may have reduced statistical "
+                        "power and increased false negative rate.",
+                        level="warning",
+                    )
+                    has_warnings = True
+
+                if de_qc.get("multiple_testing_note"):
+                    _create_warning_banner(
+                        de_qc["multiple_testing_note"]
+                        + ". See MULTIPLE_TESTING_WARNING.txt for details.",
+                        level="info",
+                    )
+
+                if deseq2_gene_wise or dexseq_gene_wise:
+                    gene_wise_details = []
+                    if deseq2_gene_wise:
+                        gene_wise_details.append(
+                            "DESeq2: " + ", ".join(sorted(deseq2_gene_wise))
+                        )
+                    if dexseq_gene_wise:
+                        gene_wise_details.append(
+                            "DEXSeq: " + ", ".join(sorted(dexseq_gene_wise))
+                        )
+                    _create_warning_banner(
+                        "Gene-wise dispersion fallback used (reduced power). "
+                        + " ".join(gene_wise_details),
+                        level="warning",
+                    )
+                    has_warnings = True
+
+                if dexseq_covariate_drops:
+                    drop_details = [
+                        f"{contrast} ({', '.join(columns)})"
+                        for contrast, columns in sorted(dexseq_covariate_drops)
+                    ]
+                    _create_warning_banner(
+                        "DEXSeq covariates dropped due to rank-deficient design. "
+                        f"Affected: {'; '.join(drop_details)}",
+                        level="warning",
+                    )
+                    has_warnings = True
+
+                if failed_dge:
+                    _create_warning_banner(
+                        "DGE Analysis Failed: "
+                        f"{len(failed_dge)} contrast(s) could not complete "
+                        "DGE testing. "
+                        f"Affected: {', '.join(failed_dge)}. "
+                        "See DGE_ANALYSIS_FAILED.txt files for details.",
+                        level="danger",
+                    )
+                    has_warnings = True
+
+                # Check for failed DTU analyses
+                failed_dtu = []
+                for contrast_name, contrast_data in de_qc.get(
+                    "contrasts", {}
+                ).items():
+                    if contrast_data.get("dtu_status") == "FAILED":
+                        failed_dtu.append(contrast_name)
+
+                if failed_dtu:
+                    _create_warning_banner(
+                        "DTU Analysis Failed: "
+                        f"{len(failed_dtu)} contrast(s) could not perform "
+                        "DTU testing. "
+                        f"Affected: {', '.join(failed_dtu)}. "
+                        "See DTU_ANALYSIS_FAILED.txt files for details.",
+                        level="danger",
+                    )
+                    has_warnings = True
+
+                # Experimental design summary
+                h4("Experimental Design")
+                covariates = _as_string_list(de_qc.get("covariates"))
+                covariates_value = ", ".join(covariates) if covariates else "none"
+                design_stats = pd.DataFrame(
+                    [
+                        ("Total samples", de_qc.get("total_samples", 0)),
+                        (
+                            "Condition column",
+                            de_qc.get("condition_column", "N/A"),
+                        ),
+                        (
+                            "Reference level",
+                            de_qc.get("reference_level", "N/A"),
+                        ),
+                        ("Covariates", covariates_value),
+                        (
+                            "Number of contrasts",
+                            de_qc.get("num_contrasts", 0),
+                        ),
+                    ],
+                    columns=["Parameter", "Value"],
+                )
+                DataTable.from_pandas(
+                    design_stats,
+                    paging=False,
+                    searchable=False,
+                    use_index=False,
+                )
+
+                # Sample sizes per group
+                if "samples_per_group" in de_qc:
+                    h4("Sample Sizes per Group")
+                    sample_size_data = []
+                    for group, count in de_qc["samples_per_group"].items():
+                        status = (
+                            "✓" if count >= 3 else "⚠️" if count >= 2 else "❌"
+                        )
+                        note = (
+                            "OK"
+                            if count >= 3
+                            else "Low power"
+                            if count >= 2
+                            else "Too few"
+                        )
+                        sample_size_data.append(
+                            {
+                                "Group": group,
+                                "Samples": count,
+                                "Status": status,
+                                "Note": note,
+                            }
+                        )
+                    sample_df = pd.DataFrame(sample_size_data)
+                    DataTable.from_pandas(
+                        sample_df,
+                        paging=False,
+                        use_index=False,
+                    )
+
+                h4("Statistical Methods & Warnings")
+                if method_rows:
+                    method_df = pd.DataFrame(method_rows)
+                    DataTable.from_pandas(
+                        method_df,
+                        paging=False,
+                        use_index=False,
+                    )
+                else:
+                    p("No contrast-level QC metadata was found.")
+
+                # Per-contrast summary
+                if "contrasts" in de_qc:
+                    h4("Results Summary by Contrast")
+                    contrast_summary_data = []
+                    for contrast_name, contrast_data in de_qc["contrasts"].items():
+                        dtu_genes = (
+                            contrast_data.get("dtu_significant_genes", 0)
+                            if contrast_data.get("dtu_status") == "SUCCESS"
+                            else "N/A"
+                        )
+                        contrast_summary_data.append(
+                            {
+                                "Contrast": contrast_name,
+                                "Samples": (
+                                    f"{contrast_data.get('n_target', 0)} "
+                                    f"vs "
+                                    f"{contrast_data.get('n_reference', 0)}"
+                                ),
+                                "DGE Status": contrast_data.get(
+                                    "dge_status", "N/A"
+                                ),
+                                "DGE Significant (FDR<0.05)": (
+                                    contrast_data.get(
+                                        "dge_significant_fdr05", 0
+                                    )
+                                    if contrast_data.get("dge_status") == "SUCCESS"
+                                    else "N/A"
+                                ),
+                                "DGE Up": (
+                                    contrast_data.get("dge_upregulated", 0)
+                                    if contrast_data.get("dge_status") == "SUCCESS"
+                                    else "N/A"
+                                ),
+                                "DGE Down": (
+                                    contrast_data.get("dge_downregulated", 0)
+                                    if contrast_data.get("dge_status") == "SUCCESS"
+                                    else "N/A"
+                                ),
+                                "DTU Status": contrast_data.get(
+                                    "dtu_status", "N/A"
+                                ),
+                                "DTU Genes (q<0.05)": dtu_genes,
+                            }
+                        )
+                    contrast_summary_df = pd.DataFrame(contrast_summary_data)
+                    DataTable.from_pandas(
+                        contrast_summary_df,
+                        paging=False,
+                        use_index=False,
+                    )
+
+                # Warnings summary table
+                if has_warnings:
+                    h4("Quality Warnings Summary")
+                    warnings_data = []
+                    if sample_size_warnings:
+                        warnings_data.append(
+                            {
+                                "Warning Type": "Sample Size",
+                                "Details": "; ".join(sample_size_warnings),
+                            }
+                        )
+                    if deseq2_gene_wise or dexseq_gene_wise:
+                        engines = []
+                        if deseq2_gene_wise:
+                            engines.append(
+                                f"DESeq2 ({len(deseq2_gene_wise)} contrasts)"
+                            )
+                        if dexseq_gene_wise:
+                            engines.append(
+                                f"DEXSeq ({len(dexseq_gene_wise)} contrasts)"
+                            )
+                        warnings_data.append(
+                            {
+                                "Warning Type": "Gene-wise Dispersion Fallback",
+                                "Details": "; ".join(engines),
+                            }
+                        )
+                    if dexseq_covariate_drops:
+                        warnings_data.append(
+                            {
+                                "Warning Type": "DEXSeq Covariates Dropped",
+                                "Details": (
+                                    f"{len(dexseq_covariate_drops)} "
+                                    "contrasts affected"
+                                ),
+                            }
+                        )
+                    if failed_dtu:
+                        warnings_data.append(
+                            {
+                                "Warning Type": "DTU Failure",
+                                "Details": (
+                                    f"{len(failed_dtu)} contrasts failed"
+                                ),
+                            }
+                        )
+                    if failed_dge:
+                        warnings_data.append(
+                            {
+                                "Warning Type": "DGE Failure",
+                                "Details": (
+                                    f"{len(failed_dge)} contrasts failed"
+                                ),
+                            }
+                        )
+
+                    warnings_df = pd.DataFrame(warnings_data)
+                    DataTable.from_pandas(warnings_df, paging=False, use_index=False)
+
+        if de_qc:
+            condition_column = de_qc.get("condition_column")
+            cohort_cpm = _load_cpm_tables(args.cohort_dir, sample_aliases)
+            cohort_samples = _load_cohort_samples(args.cohort_dir)
+
+        with report.add_section("Differential gene expression", "DGE"):
+            p(
+                "Differential gene expression results from DESeq2. The "
+                "heatmap, PCA plot, and sample distance matrix are derived "
+                "from CPM-normalised counts "
+                "and give an overview of sample clustering relative to "
+                "the experimental conditions. Each contrast tab shows a "
+                "results table of genes ranked by adjusted p-value and a "
+                "volcano plot highlighting significantly up- and "
+                "down-regulated genes."
+            )
+            dom_style(raw(_heatmap_style() + _volcano_style()))
+            if condition_column:
+                if cohort_cpm['gene'] is None:
+                    _create_warning_banner(
+                        "Cohort gene CPM table is missing or empty. ")
+                else:
+                    hierarchical_result = hierarchical(
+                        cohort_cpm["gene"],
+                        id_column="GENEID",
+                        samples=cohort_samples,
+                        condition_column=condition_column,
+                        top_n=150,
+                    )
+                    if hierarchical_result.error is not None:
+                        _create_warning_banner(
+                            hierarchical_result.error, level='warning')
+                    else:
+                        with div(cls="heatmap-table-grid"):
+                            EZChart(hierarchical_result.heatmap, width="100%")
+                            EZChart(hierarchical_result.pca, width="100%")
+                            EZChart(hierarchical_result.distance, width="100%")
+                        with div(cls="info-text"):
+                            br()
+                            clustering_info('gene')
+            tabs = Tabs()
+            for contrast, table in _contrast_results(
+                args.de_dir, "results_dge.tsv"
+            ).items():
+                with tabs.add_tab(contrast):
+                    # Check for contrast-specific warnings
+                    if de_qc and contrast in de_qc.get("contrasts", {}):
+                        contrast_data = de_qc["contrasts"][contrast]
+                        if contrast_data.get("dge_status") == "FAILED":
+                            _create_warning_banner(
+                                "DGE analysis failed for this contrast. "
+                                f"See {contrast}/"
+                                "DGE_ANALYSIS_FAILED.txt for detailed "
+                                "explanation.",
+                                level="danger",
+                            )
+                            p(
+                                "Empty results indicate analysis failure, "
+                                "not 'no DGE detected'."
+                            )
+                        elif contrast_data.get("dtu_power_warning"):
+                            with div(
+                                style=(
+                                    "padding: 10px; margin-bottom: 10px; "
+                                    "background-color: #fff3cd; "
+                                    "border-radius: 4px;"
+                                )
+                            ):
+                                with p():
+                                    strong("Note: ")
+                                    raw(contrast_data["dtu_power_warning"])
+                    DataTable.from_pandas(
+                        _round_de_table(table.head(args.de_table_size)),
+                        use_index=False
+                    )
+                    with div(cls="info-text"):
+                        raw(
+                            f"Table showing the top {args.de_table_size} genes sorted "
+                            "by adjusted p-value. <br><br><br>"
+                        )
+
+                    h3("Gene expression volcano Plot")
+                    gn_vol, gn_class_table, gn_selected_table, vol_text = volcano(table)
+                    with div(_class="volcano-plot-grid"):
+                        EZChart(gn_vol, width="100%", height="550")
+                        with div(_class="volcano-side-panel"):
+                            EZChart(gn_class_table, width="100%", height="auto")
+                            EZChart(gn_selected_table, width="100%", height="auto")
+                        if vol_text is not None:
+                            with div(cls="info-text"):
+                                raw(vol_text)
+
+        with report.add_section("Differential transcript usage", "DTU"):
+            p(
+                "Differential transcript usage results from DEXSeq. Unlike "
+                "DGE, DTU tests whether individual transcripts change their "
+                "proportional contribution to total gene expression between "
+                "conditions , i.e. isoform switching , rather than testing "
+                "for changes in total gene abundance. The heatmap, PCA, and "
+                "sample distance matrix use CPM-normalised counts. "
+                "Each contrast tab shows a "
+                "results table ranked by adjusted p-value and a volcano plot."
+            )
+            if condition_column:
+                if cohort_cpm["transcript"] is None:
+                    _create_warning_banner(
+                        "Cohort transcript CPM table is missing or empty.")
+                else:
+                    hierarchical_result = hierarchical(
+                        cohort_cpm["transcript"],
+                        id_column="TXNAME",
+                        top_n=150,
+                        samples=cohort_samples,
+                        condition_column=condition_column
+                    )
+                    if hierarchical_result.error is not None:
+                        _create_warning_banner(
+                            hierarchical_result.error, level='warning')
+                    else:
+                        with div(cls="heatmap-table-grid"):
+                            EZChart(hierarchical_result.heatmap, width="100%")
+                            EZChart(hierarchical_result.pca, width="100%")
+                            EZChart(hierarchical_result.distance, width="100%")
+                        with div(cls="info-text"):
+                            br()
+                            clustering_info('transcript')
+
+            tabs = Tabs()
+            dtu_tables = _contrast_results(
+                args.de_dir, "results_dtu_transcript.tsv")
+
+            for contrast in sorted(Path(args.de_dir).iterdir()):
+                if not contrast.is_dir():
+                    continue
+                contrast_name = contrast.name
+
+                with tabs.add_tab(contrast_name):
+                    # Check if DTU failed for this contrast
+                    if de_qc and contrast_name in de_qc.get("contrasts", {}):
+                        contrast_data = de_qc["contrasts"][contrast_name]
+                        if contrast_data.get("dtu_status") == "FAILED":
+                            _create_warning_banner(
+                                "DTU analysis failed for this contrast. "
+                                f"See {contrast_name}/"
+                                "DTU_ANALYSIS_FAILED.txt for detailed "
+                                "explanation.",
+                                level="danger",
+                            )
+                            failure_hint = contrast_data.get("dtu_failure_hint")
+                            if failure_hint:
+                                p(f"Probable cause: {failure_hint}")
+                            p(
+                                "Empty results indicate analysis failure, "
+                                "not 'no DTU detected'."
+                            )
+                        elif contrast_data.get("dtu_power_warning"):
+                            _create_warning_banner(
+                                contrast_data["dtu_power_warning"],
+                                level="warning",
+                            )
+
+                    if contrast_name in dtu_tables:
+                        dtu_table = dtu_tables[contrast_name]
+                        DataTable.from_pandas(
+                            _round_de_table(dtu_table.head(args.de_table_size)),
+                            use_index=False
+                        )
+                        with div(cls="info-text"):
+                            raw(
+                                f"Table showing the top {args.de_table_size} "
+                                "transcripts sorted by adjusted p-value. <br><br><br>"
+                            )
+
+                        h3("Transcript expression volcano Plot")
+                        (
+                            tr_vol, tr_class_table, tr_selected_table, vol_text
+                        ) = volcano(dtu_table)
+                        with div(_class="volcano-plot-grid"):
+                            EZChart(tr_vol, width="100%", height="550")
+                            with div(_class="volcano-side-panel"):
+                                EZChart(tr_class_table, width="100%", height="auto")
+                                EZChart(tr_selected_table, width="100%", height="auto")
+                            if vol_text is not None:
+                                with div(cls="info-text"):
+                                    raw(vol_text)
+                    else:
+                        p("No DTU results available for this contrast.")
 
     report.write(args.report)
+    logger.info("Report written to %s.", args.report)
+
+
+def argparser():
+    """Argument parser for the report entry point."""
+    parser = wf_parser("report")
+    parser.add_argument("report", help="Report output file.")
+    parser.add_argument("--metadata", required=True, help="Sample metadata JSON.")
+    parser.add_argument("--stats", nargs="+", help="Per-read stats paths.")
+    parser.add_argument(
+        "--cohort_dir",
+        required=True,
+        help="Cohort output directory.",
+    )
+    parser.add_argument(
+        "--samples_dir",
+        required=True,
+        help="Per-sample output directory.",
+    )
+    parser.add_argument(
+        "--mod_summary_dir",
+        default=None,
+        help="Modified base summary directory.",
+    )
+    parser.add_argument(
+        "--sqanti_dir",
+        required=True,
+        help="SQANTI output directory.",
+    )
+    parser.add_argument(
+        "--de_dir",
+        default=None,
+        help="Differential analysis directory.",
+    )
+    parser.add_argument(
+        "--ref_summary",
+        default=None,
+        help="Annotation reference summary TSV.",
+    )
+    parser.add_argument(
+        "--de_table_size",
+        default=500,
+        type=int,
+        help="Number of rows to show in DE/DTU result tables.",
+    )
+    parser.add_argument("--versions", required=True, help="Versions directory.")
+    parser.add_argument("--params", required=True, help="Workflow params JSON.")
+    parser.add_argument(
+        "--wf_version",
+        default="unknown",
+        help="Workflow version.",
+    )
+    return parser
